@@ -383,50 +383,223 @@ const DASH_PATTERNS = {
 };
 
 // ── OMML (Office Math) -> MathML + лінійний текст (формули на слайдах) ──
+// Повне покриття ECMA-376 Part 1 §22.1: дроби (всі типи), індекси, корені, дужки,
+// n-арні оператори, функції, границі, акценти, риски, groupChr, матриці, системи
+// рівнянь (eqArr), pre-індекси (sPre), box/borderBox/phant та стилі рунів (nor/sty/scr).
 const xmlEscMath = (s) => String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-const mmlVal = (el, def) => (el ? (el.getAttribute('m:val') || el.getAttribute('val') || def) : def);
+const mmlVal = (el, def) => {
+    if (!el) return def;
+    const v = el.getAttribute('m:val') != null ? el.getAttribute('m:val') : el.getAttribute('val');
+    return v == null ? def : v; // порожній рядок ("") — валідне значення (напр. "без дужки")
+};
+// OnOff-властивість OMML: присутність елемента без val означає "увімкнено"
+const mmlOn = (el, defWhenMissing = false) => {
+    if (!el) return defWhenMissing;
+    const v = mmlVal(el, 'on');
+    return !(v === '0' || v === 'off' || v === 'false');
+};
 const mmlChild = (el, ln) => (el ? Array.from(el.children).find(c => c.localName === ln) : null);
 const mmlChildren = (el, ln) => (el ? Array.from(el.children).filter(c => c.localName === ln) : []);
 const ommlTokens = (txt) => {
     let o = '';
-    for (const ch of Array.from(txt || '')) {
-        if (/\s/.test(ch)) o += '<mspace width="0.25em"/>';
-        else if (/[0-9.,]/.test(ch)) o += `<mn>${xmlEscMath(ch)}</mn>`;
-        else if (/[A-Za-zА-Яа-яΑ-Ωα-ω]/.test(ch)) o += `<mi>${xmlEscMath(ch)}</mi>`;
-        else o += `<mo>${xmlEscMath(ch)}</mo>`;
+    // Числа групуємо в один <mn> (12.5 — один токен), літери -> <mi>, решта -> <mo>
+    const parts = String(txt || '').match(/\d+(?:[.,]\d+)*|\s+|[\s\S]/g) || [];
+    for (const p of parts) {
+        if (/^\s+$/.test(p)) o += '<mspace width="0.25em"/>';
+        else if (/^\d/.test(p)) o += `<mn>${xmlEscMath(p)}</mn>`;
+        else if (/^[A-Za-zА-Яа-яЁёІіЇїЄєҐґΑ-Ωα-ω∞ℏ∂∇]$/.test(p)) o += `<mi>${xmlEscMath(p)}</mi>`;
+        else if (p === '-') o += '<mo>−</mo>';
+        else o += `<mo>${xmlEscMath(p)}</mo>`;
     }
     return o;
+};
+// Стиль запису руна: m:nor -> звичайний текст, m:sty/m:scr -> mathvariant
+const MML_STY_VARIANT = { p: 'normal', b: 'bold', i: 'italic', bi: 'bold-italic' };
+const MML_SCR_VARIANT = {
+    script: 'script', fraktur: 'fraktur', 'double-struck': 'double-struck',
+    'sans-serif': 'sans-serif', monospace: 'monospace'
+};
+const ommlRun = (r) => {
+    const rPr = mmlChild(r, 'rPr');
+    const txt = mmlChildren(r, 't').map(t => t.textContent).join('');
+    // m:brk у rPr — примусовий розрив рядка формули
+    let out = rPr && mmlChild(rPr, 'brk') ? '<mspace linebreak="newline"/>' : '';
+    if (rPr && mmlOn(mmlChild(rPr, 'nor'))) return out + `<mtext>${xmlEscMath(txt)}</mtext>`;
+    const sty = mmlVal(mmlChild(rPr, 'sty'), null);
+    const scr = mmlVal(mmlChild(rPr, 'scr'), null);
+    const variant = (scr && MML_SCR_VARIANT[scr]) || (sty && MML_STY_VARIANT[sty]) || null;
+    const body = ommlTokens(txt);
+    return out + (variant ? `<mstyle mathvariant="${variant}">${body}</mstyle>` : body);
 };
 const ommlToMathmlInner = (el) => {
     let out = '';
     const I = ommlToMathmlInner;
+    const R = (node) => `<mrow>${node ? I(node) : ''}</mrow>`;
     for (const c of Array.from(el.children)) {
         const ln = c.localName;
         if (ln.endsWith('Pr')) continue;
         switch (ln) {
-            case 'r': { const t = mmlChild(c, 't'); out += ommlTokens(t ? t.textContent : ''); break; }
+            case 'r': out += ommlRun(c); break;
             case 't': out += ommlTokens(c.textContent); break;
-            case 'f': { const n = mmlChild(c, 'num'), d = mmlChild(c, 'den'); out += `<mfrac><mrow>${n ? I(n) : ''}</mrow><mrow>${d ? I(d) : ''}</mrow></mfrac>`; break; }
-            case 'sSup': { const e = mmlChild(c, 'e'), s = mmlChild(c, 'sup'); out += `<msup><mrow>${e ? I(e) : ''}</mrow><mrow>${s ? I(s) : ''}</mrow></msup>`; break; }
-            case 'sSub': { const e = mmlChild(c, 'e'), s = mmlChild(c, 'sub'); out += `<msub><mrow>${e ? I(e) : ''}</mrow><mrow>${s ? I(s) : ''}</mrow></msub>`; break; }
-            case 'sSubSup': { const e = mmlChild(c, 'e'), sb = mmlChild(c, 'sub'), sp = mmlChild(c, 'sup'); out += `<msubsup><mrow>${e ? I(e) : ''}</mrow><mrow>${sb ? I(sb) : ''}</mrow><mrow>${sp ? I(sp) : ''}</mrow></msubsup>`; break; }
-            case 'rad': { const deg = mmlChild(c, 'deg'), e = mmlChild(c, 'e'); out += (deg && deg.children.length) ? `<mroot><mrow>${e ? I(e) : ''}</mrow><mrow>${I(deg)}</mrow></mroot>` : `<msqrt><mrow>${e ? I(e) : ''}</mrow></msqrt>`; break; }
-            case 'd': { const dPr = mmlChild(c, 'dPr'); const b = mmlVal(mmlChild(dPr, 'begChr'), '('); const en = mmlVal(mmlChild(dPr, 'endChr'), ')'); const es = mmlChildren(c, 'e').map(I).join('<mo>,</mo>'); out += `<mrow><mo>${xmlEscMath(b)}</mo>${es}<mo>${xmlEscMath(en)}</mo></mrow>`; break; }
-            case 'nary': { const np = mmlChild(c, 'naryPr'); const chr = mmlVal(mmlChild(np, 'chr'), '∫'); const sb = mmlChild(c, 'sub'), sp = mmlChild(c, 'sup'), e = mmlChild(c, 'e'); const op = `<mo>${xmlEscMath(chr)}</mo>`; const hasL = (sb && sb.children.length) || (sp && sp.children.length); const big = hasL ? `<munderover>${op}<mrow>${sb ? I(sb) : ''}</mrow><mrow>${sp ? I(sp) : ''}</mrow></munderover>` : op; out += `${big}<mrow>${e ? I(e) : ''}</mrow>`; break; }
-            case 'func': { const fn = mmlChild(c, 'fName'), e = mmlChild(c, 'e'); out += `<mrow>${fn ? I(fn) : ''}<mo>&#x2061;</mo><mrow>${e ? I(e) : ''}</mrow></mrow>`; break; }
-            case 'limLow': { const e = mmlChild(c, 'e'), lim = mmlChild(c, 'lim'); out += `<munder><mrow>${e ? I(e) : ''}</mrow><mrow>${lim ? I(lim) : ''}</mrow></munder>`; break; }
-            case 'limUpp': { const e = mmlChild(c, 'e'), lim = mmlChild(c, 'lim'); out += `<mover><mrow>${e ? I(e) : ''}</mrow><mrow>${lim ? I(lim) : ''}</mrow></mover>`; break; }
-            case 'acc': { const e = mmlChild(c, 'e'); const ap = mmlChild(c, 'accPr'); const chr = mmlVal(mmlChild(ap, 'chr'), '^'); out += `<mover><mrow>${e ? I(e) : ''}</mrow><mo>${xmlEscMath(chr)}</mo></mover>`; break; }
-            case 'bar': { const e = mmlChild(c, 'e'); out += `<mover><mrow>${e ? I(e) : ''}</mrow><mo>&#x00AF;</mo></mover>`; break; }
-            case 'e': case 'num': case 'den': case 'sub': case 'sup': case 'deg': case 'fName': case 'lim': case 'oMath': case 'oMathPara':
+            case 'f': { // дріб: bar (звичайний), lin (лінійний a/b), skw (скісний), noBar (без риски)
+                const fType = mmlVal(mmlChild(mmlChild(c, 'fPr'), 'type'), 'bar');
+                const n = R(mmlChild(c, 'num')), d = R(mmlChild(c, 'den'));
+                if (fType === 'lin') out += `<mrow>${n}<mo>/</mo>${d}</mrow>`;
+                else if (fType === 'skw') out += `<mfrac bevelled="true">${n}${d}</mfrac>`;
+                else if (fType === 'noBar') out += `<mfrac linethickness="0">${n}${d}</mfrac>`;
+                else out += `<mfrac>${n}${d}</mfrac>`;
+                break;
+            }
+            case 'sSup': out += `<msup>${R(mmlChild(c, 'e'))}${R(mmlChild(c, 'sup'))}</msup>`; break;
+            case 'sSub': out += `<msub>${R(mmlChild(c, 'e'))}${R(mmlChild(c, 'sub'))}</msub>`; break;
+            case 'sSubSup': out += `<msubsup>${R(mmlChild(c, 'e'))}${R(mmlChild(c, 'sub'))}${R(mmlChild(c, 'sup'))}</msubsup>`; break;
+            case 'sPre': // pre-індекси (напр. ₙCₖ) -> mmultiscripts
+                out += `<mmultiscripts>${R(mmlChild(c, 'e'))}<mprescripts/>${R(mmlChild(c, 'sub'))}${R(mmlChild(c, 'sup'))}</mmultiscripts>`; break;
+            case 'rad': {
+                const deg = mmlChild(c, 'deg');
+                const degHide = mmlOn(mmlChild(mmlChild(c, 'radPr'), 'degHide'));
+                out += (!degHide && deg && deg.children.length)
+                    ? `<mroot>${R(mmlChild(c, 'e'))}${R(deg)}</mroot>`
+                    : `<msqrt>${R(mmlChild(c, 'e'))}</msqrt>`;
+                break;
+            }
+            case 'd': { // дужки; begChr/endChr="" означає "без дужки", sepChr — роздільник аргументів
+                const dPr = mmlChild(c, 'dPr');
+                const b = mmlVal(mmlChild(dPr, 'begChr'), '(');
+                const en = mmlVal(mmlChild(dPr, 'endChr'), ')');
+                const sep = mmlVal(mmlChild(dPr, 'sepChr'), '|');
+                const es = mmlChildren(c, 'e').map(R).join(`<mo>${xmlEscMath(sep)}</mo>`);
+                out += `<mrow>${b ? `<mo stretchy="true">${xmlEscMath(b)}</mo>` : ''}${es}${en ? `<mo stretchy="true">${xmlEscMath(en)}</mo>` : ''}</mrow>`;
+                break;
+            }
+            case 'nary': { // ∑ ∏ ∫ ⋃ ... з межами під/над (undOvr) або як індекси (subSup)
+                const np = mmlChild(c, 'naryPr');
+                const chr = mmlVal(mmlChild(np, 'chr'), '∫');
+                const limLoc = mmlVal(mmlChild(np, 'limLoc'), 'undOvr');
+                const sb = mmlChild(c, 'sub'), sp = mmlChild(c, 'sup');
+                const hasSub = !mmlOn(mmlChild(np, 'subHide')) && sb && sb.children.length;
+                const hasSup = !mmlOn(mmlChild(np, 'supHide')) && sp && sp.children.length;
+                const op = `<mo stretchy="true">${xmlEscMath(chr)}</mo>`;
+                const [tagBoth, tagSub, tagSup] = limLoc === 'subSup'
+                    ? ['msubsup', 'msub', 'msup'] : ['munderover', 'munder', 'mover'];
+                let big = op;
+                if (hasSub && hasSup) big = `<${tagBoth}>${op}${R(sb)}${R(sp)}</${tagBoth}>`;
+                else if (hasSub) big = `<${tagSub}>${op}${R(sb)}</${tagSub}>`;
+                else if (hasSup) big = `<${tagSup}>${op}${R(sp)}</${tagSup}>`;
+                out += `<mrow>${big}${R(mmlChild(c, 'e'))}</mrow>`;
+                break;
+            }
+            case 'func': out += `<mrow>${R(mmlChild(c, 'fName'))}<mo>&#x2061;</mo>${R(mmlChild(c, 'e'))}</mrow>`; break;
+            case 'limLow': out += `<munder>${R(mmlChild(c, 'e'))}${R(mmlChild(c, 'lim'))}</munder>`; break;
+            case 'limUpp': out += `<mover>${R(mmlChild(c, 'e'))}${R(mmlChild(c, 'lim'))}</mover>`; break;
+            case 'acc': { // акцент; типовий символ — комбінований циркумфлекс U+0302
+                const chr = mmlVal(mmlChild(mmlChild(c, 'accPr'), 'chr'), '̂');
+                out += `<mover accent="true">${R(mmlChild(c, 'e'))}<mo>${xmlEscMath(chr)}</mo></mover>`;
+                break;
+            }
+            case 'bar': { // риска над (pos=top) або під (типово bot) виразом
+                const pos = mmlVal(mmlChild(mmlChild(c, 'barPr'), 'pos'), 'bot');
+                out += pos === 'top'
+                    ? `<mover>${R(mmlChild(c, 'e'))}<mo>&#x00AF;</mo></mover>`
+                    : `<munder>${R(mmlChild(c, 'e'))}<mo>&#x005F;</mo></munder>`;
+                break;
+            }
+            case 'groupChr': { // групувальний символ (фігурна дужка під/над виразом)
+                const gPr = mmlChild(c, 'groupChrPr');
+                const chr = mmlVal(mmlChild(gPr, 'chr'), '⏟');
+                const pos = mmlVal(mmlChild(gPr, 'pos'), 'bot');
+                out += pos === 'top'
+                    ? `<mover>${R(mmlChild(c, 'e'))}<mo stretchy="true">${xmlEscMath(chr)}</mo></mover>`
+                    : `<munder>${R(mmlChild(c, 'e'))}<mo stretchy="true">${xmlEscMath(chr)}</mo></munder>`;
+                break;
+            }
+            case 'm': { // матриця: m:mr — рядки, m:e — комірки
+                const rows = mmlChildren(c, 'mr')
+                    .map(mr => `<mtr>${mmlChildren(mr, 'e').map(e => `<mtd>${R(e)}</mtd>`).join('')}</mtr>`).join('');
+                out += `<mtable>${rows}</mtable>`;
+                break;
+            }
+            case 'eqArr': { // система/масив рівнянь — кожен m:e з нового рядка
+                const rows = mmlChildren(c, 'e')
+                    .map(e => `<mtr><mtd columnalign="left">${R(e)}</mtd></mtr>`).join('');
+                out += `<mtable>${rows}</mtable>`;
+                break;
+            }
+            case 'box': out += R(mmlChild(c, 'e')); break;
+            case 'borderBox': out += `<menclose notation="box">${R(mmlChild(c, 'e'))}</menclose>`; break;
+            case 'phant': out += `<mphantom>${R(mmlChild(c, 'e'))}</mphantom>`; break;
+            case 'e': case 'num': case 'den': case 'sub': case 'sup': case 'deg': case 'fName': case 'lim':
+            case 'oMath': case 'oMathPara':
                 out += I(c); break;
             default: if (c.children.length) out += I(c);
         }
     }
     return out;
 };
-const ommlToMathml = (el) => `<math xmlns="http://www.w3.org/1998/Math/MathML" display="block">${ommlToMathmlInner(el)}</math>`;
-const findOMath = (root) => (root ? Array.from(root.getElementsByTagName('*')).find(e => e.localName === 'oMath') : null);
+const ommlToMathml = (el, display = 'block') =>
+    `<math xmlns="http://www.w3.org/1998/Math/MathML" display="${display}">${ommlToMathmlInner(el)}</math>`;
+// Усі формули всередині вузла (їх може бути кілька в одному текстовому блоці)
+const findOMaths = (root) => (root ? Array.from(root.getElementsByTagName('*')).filter(e => e.localName === 'oMath') : []);
+
+// Лінійний (UnicodeMath-подібний) запис формули — для canvas-рендера відео та TTS
+const SUP_MAP = { '0': '⁰', '1': '¹', '2': '²', '3': '³', '4': '⁴', '5': '⁵', '6': '⁶', '7': '⁷', '8': '⁸', '9': '⁹', '+': '⁺', '-': '⁻', '−': '⁻', '=': '⁼', '(': '⁽', ')': '⁾', 'n': 'ⁿ', 'i': 'ⁱ' };
+const SUB_MAP = { '0': '₀', '1': '₁', '2': '₂', '3': '₃', '4': '₄', '5': '₅', '6': '₆', '7': '₇', '8': '₈', '9': '₉', '+': '₊', '-': '₋', '−': '₋', '=': '₌', '(': '₍', ')': '₎' };
+const toScript = (s, map) => {
+    const cs = Array.from(String(s || '').trim());
+    return cs.length && cs.every(ch => map[ch]) ? cs.map(ch => map[ch]).join('') : null;
+};
+const linWrap = (s) => { const t = String(s || '').trim(); return Array.from(t).length > 1 ? `(${t})` : t; };
+const ommlToLinear = (el) => {
+    const L = ommlToLinear;
+    const child = (c, ln) => { const e = mmlChild(c, ln); return e ? L(e) : ''; };
+    const sup = (s) => toScript(s, SUP_MAP) || `^${linWrap(s)}`;
+    const sub = (s) => toScript(s, SUB_MAP) || `_${linWrap(s)}`;
+    let out = '';
+    for (const c of Array.from(el.children)) {
+        const ln = c.localName;
+        if (ln.endsWith('Pr')) continue;
+        switch (ln) {
+            case 'r': out += mmlChildren(c, 't').map(t => t.textContent).join(''); break;
+            case 't': out += c.textContent; break;
+            case 'f': out += `${linWrap(child(c, 'num'))}/${linWrap(child(c, 'den'))}`; break;
+            case 'sSup': out += child(c, 'e') + sup(child(c, 'sup')); break;
+            case 'sSub': out += child(c, 'e') + sub(child(c, 'sub')); break;
+            case 'sSubSup': out += child(c, 'e') + sub(child(c, 'sub')) + sup(child(c, 'sup')); break;
+            case 'sPre': out += sub(child(c, 'sub')) + sup(child(c, 'sup')) + child(c, 'e'); break;
+            case 'rad': {
+                const dg = mmlChild(c, 'deg');
+                const showDeg = dg && dg.children.length && !mmlOn(mmlChild(mmlChild(c, 'radPr'), 'degHide'));
+                out += `${showDeg ? L(dg) : ''}√(${child(c, 'e')})`;
+                break;
+            }
+            case 'd': {
+                const dPr = mmlChild(c, 'dPr');
+                out += mmlVal(mmlChild(dPr, 'begChr'), '(')
+                    + mmlChildren(c, 'e').map(L).join(mmlVal(mmlChild(dPr, 'sepChr'), '|'))
+                    + mmlVal(mmlChild(dPr, 'endChr'), ')');
+                break;
+            }
+            case 'nary': {
+                const np = mmlChild(c, 'naryPr');
+                const sb = mmlChild(c, 'sub'), sp = mmlChild(c, 'sup');
+                let s = mmlVal(mmlChild(np, 'chr'), '∫');
+                if (!mmlOn(mmlChild(np, 'subHide')) && sb && sb.children.length) s += sub(L(sb));
+                if (!mmlOn(mmlChild(np, 'supHide')) && sp && sp.children.length) s += sup(L(sp));
+                out += `${s} ${child(c, 'e')}`;
+                break;
+            }
+            case 'func': out += `${child(c, 'fName')} ${child(c, 'e')}`; break;
+            case 'limLow': case 'limUpp': out += child(c, 'e') + sub(child(c, 'lim')); break;
+            case 'acc': out += child(c, 'e') + mmlVal(mmlChild(mmlChild(c, 'accPr'), 'chr'), '̂'); break;
+            case 'bar': out += child(c, 'e') + '̅'; break;
+            case 'groupChr': out += child(c, 'e'); break;
+            case 'm': out += '[' + mmlChildren(c, 'mr').map(mr => mmlChildren(mr, 'e').map(L).join('  ')).join('; ') + ']'; break;
+            case 'eqArr': out += mmlChildren(c, 'e').map(L).join('; '); break;
+            default: out += L(c);
+        }
+    }
+    return out;
+};
 
 // Розміри наконечника стрілки PowerPoint (множники товщини лінії) — len/w: sm/med/lg
 const ARROW_LEN = { sm: 2.5, med: 3.5, lg: 5 };
@@ -755,7 +928,7 @@ const getRenderRuns = (line) => {
     if (line.runs && line.runs.length) runs = line.runs;
     else if (line.text) runs = [{ ...baseStyle, text: line.bullet ? line.text.slice(line.bullet.length) : line.text }];
     else runs = [];
-    if (line.bullet) runs = [{ ...(runs[0] || baseStyle), underline: false, strike: false, text: line.bullet }, ...runs];
+    if (line.bullet) runs = [{ ...(runs[0] || baseStyle), underline: false, strike: false, math: false, mathml: null, text: line.bullet }, ...runs];
     return runs;
 };
 
@@ -784,7 +957,10 @@ const layoutRichText = (octx, line, maxWidth) => {
         const fs = r.fontSize || 24;
         const ls = r.letterSpacing || 0;
         octx.font = buildRunFont(r);
-        const tokens = String(r.text || '').split(/(\s+)/).filter(t => t.length);
+        // Математичний run — один нерозривний токен (формулу не ламаємо посеред запису)
+        const tokens = r.math
+            ? [String(r.text || '')]
+            : String(r.text || '').split(/(\s+)/).filter(t => t.length);
         for (const tok of tokens) {
             const tw = octx.measureText(tok).width + ls * tok.length;
             if (tok.trim() && cur.width + tw > maxWidth && cur.width > 0) flush();
@@ -1148,7 +1324,8 @@ const extractTextLines = (txBody, ptToPx, defaults = {}) => {
     const paragraphs = Array.from(txBody.children).filter(c => c.tagName === 'a:p' || c.tagName === 'p');
     for (const p of paragraphs) {
         const pPr = getDirectChild(p, 'a:pPr', 'pPr');
-        const align = pPr ? (pPr.getAttribute('algn') || 'l') : 'l';
+        const algnAttr = pPr ? pPr.getAttribute('algn') : null;
+        const align = algnAttr || 'l';
         const lvl = pPr ? (parseInt(pPr.getAttribute('lvl'), 10) || 0) : 0;
         const pDefRPr = pPr ? getDirectChild(pPr, 'a:defRPr', 'defRPr') : null;
 
@@ -1226,7 +1403,39 @@ const extractTextLines = (txBody, ptToPx, defaults = {}) => {
 
         // a:br розриває абзац на додаткові візуальні рядки (маркер — лише на першому)
         const chunks = [[]];
+        let mathParaAlign = null; // вирівнювання блочної формули (m:oMathPara/m:jc)
         for (const child of Array.from(p.children)) {
+            // ── Формула в тексті: a14:m / m:oMath(Para), інколи в mc:AlternateContent ──
+            // Конвертуємо у "математичний" run: MathML для редактора + лінійний запис для canvas
+            if (['m', 'oMath', 'oMathPara', 'AlternateContent'].includes(child.localName)) {
+                let scope = child;
+                if (child.localName === 'AlternateContent') {
+                    // Формула живе у Choice (Requires="a14"); Fallback — лише її картинка
+                    scope = Array.from(child.children).find(ch => ch.localName === 'Choice' && findOMaths(ch).length) || child;
+                }
+                const oMaths = child.localName === 'oMath' ? [child] : findOMaths(scope);
+                for (const om of oMaths) {
+                    try {
+                        const linear = ommlToLinear(om).replace(/\s+/g, ' ').trim();
+                        if (!linear) continue;
+                        // Кегль/колір/шрифт беремо з першого a:rPr формули, інакше — стилі абзацу
+                        const aRPr = Array.from(om.getElementsByTagName('*')).find(e =>
+                            e.localName === 'rPr' && e.parentNode && e.parentNode.localName === 'r'
+                            && (e.hasAttribute('sz') || e.hasAttribute('b') || e.hasAttribute('i')
+                                || Array.from(e.children).some(x => ['solidFill', 'gradFill', 'latin'].includes(x.localName))));
+                        chunks[chunks.length - 1].push({
+                            ...readRunStyle(aRPr || null), italic: true,
+                            text: linear, math: true, mathml: ommlToMathml(om, 'inline')
+                        });
+                        // Блочна формула (m:oMathPara) типово центрується
+                        if (om.parentNode && om.parentNode.localName === 'oMathPara') {
+                            const jc = mmlVal(mmlChild(mmlChild(om.parentNode, 'oMathParaPr'), 'jc'), 'center');
+                            mathParaAlign = { left: 'l', right: 'r', center: 'ctr', centerGroup: 'ctr' }[jc] || 'ctr';
+                        }
+                    } catch (e) { /* пошкоджену формулу пропускаємо, текст не втрачаємо */ }
+                }
+                continue;
+            }
             if (['a:r', 'r', 'a:fld', 'fld'].includes(child.tagName)) {
                 const t = getDirectChild(child, 'a:t', 't');
                 let runText = t ? t.textContent : '';
@@ -1277,6 +1486,8 @@ const extractTextLines = (txBody, ptToPx, defaults = {}) => {
             }
             const first = runs[0];
             const lineBullet = ci === 0 ? bullet : '';
+            // Рядок, що складається лише з блочної формули, центруємо (якщо algn не заданий явно)
+            const lineAlign = (!algnAttr && mathParaAlign && runs.every(r => r.math)) ? mathParaAlign : align;
             lines.push({
                 text: lineBullet + textContent.trim(),
                 runs,
@@ -1285,7 +1496,7 @@ const extractTextLines = (txBody, ptToPx, defaults = {}) => {
                 fontSize: Math.max(...runs.map(r => r.fontSize)),
                 bold: first.bold,
                 italic: first.italic,
-                align,
+                align: lineAlign,
                 indent: lvl,
                 lineSpacing,
                 spcBef: ci === 0 ? spcBef : 0,
@@ -1629,9 +1840,13 @@ const extractPptxData = async (file) => {
 
                 // --- mc:AlternateContent: беремо Fallback (інакше перший Choice) і парсимо його ---
                 // Так не пропускаємо елементи, загорнуті в AlternateContent (SmartArt, нові фігури тощо).
+                // Виняток — формули (Requires="a14"): справжній OMML живе у Choice,
+                // а Fallback містить лише растрову картинку рівняння.
                 if (tag === 'mc:AlternateContent' || node.localName === 'AlternateContent') {
-                    const pick = Array.from(node.children).find(c => c.localName === 'Fallback')
-                        || Array.from(node.children).find(c => c.localName === 'Choice');
+                    const acChildren = Array.from(node.children);
+                    const pick = acChildren.find(c => c.localName === 'Choice' && findOMaths(c).length)
+                        || acChildren.find(c => c.localName === 'Fallback')
+                        || acChildren.find(c => c.localName === 'Choice');
                     if (pick) {
                         const inner = Array.from(pick.children).filter(c => DRAWABLE_TAGS.includes(c.tagName));
                         if (inner.length) await parseSpTree(inner, env, groupT);
@@ -1834,19 +2049,9 @@ const extractPptxData = async (file) => {
                 }
 
                 const txBody = getDirectChild(node, 'p:txBody', 'txBody');
-                // Формула (OMML) у текстовому блоці -> окремий об'єкт 'math' (рендериться MathML)
-                const oMathEl = txBody ? findOMath(txBody) : null;
-                if (oMathEl && rect) {
-                    try {
-                        env.objects.push({
-                            ...baseObject, type: 'math', ...rect,
-                            mathml: ommlToMathml(oMathEl),
-                            textFallback: (oMathEl.textContent || '').replace(/\s+/g, ' ').trim(),
-                            color: '#111827'
-                        });
-                    } catch (e) { /* ignore */ }
-                    continue;
-                }
+                // Формули (OMML) обробляє extractTextLines: вони стають math-рунами всередині
+                // рядків тексту (інлайн у реченнях та блочні абзаци), тому текст поруч із
+                // формулами і кілька формул в одному блоці не втрачаються.
                 const parsed = txBody ? extractTextLines(txBody, ptToPx, textDefaults) : { lines: [], vAlign: 't' };
                 const hasText = parsed.lines.some(l => l.text);
 
@@ -5148,19 +5353,33 @@ export default function VideoEditor() {
                     }}
                 >
                     {runs.length === 0 ? ' ' : runs.map((r, j) => (
-                        <span
-                            key={j}
-                            style={{
-                                color: r.color || '#1e293b',
-                                fontSize: Math.max((r.fontSize || 24) * scale, 6),
-                                fontWeight: r.bold ? 700 : 400,
-                                fontStyle: r.italic ? 'italic' : 'normal',
-                                fontFamily: r.font ? `"${r.font}", ${PPT_FALLBACK_FONTS}` : PPT_FALLBACK_FONTS,
-                                textDecorationLine: [r.underline ? 'underline' : '', r.strike ? 'line-through' : ''].join(' ').trim() || undefined
-                            }}
-                        >
-                            {r.text}
-                        </span>
+                        r.math && r.mathml ? (
+                            // Формула у тексті: інлайн MathML (WYSIWYG у редакторі)
+                            <span
+                                key={j}
+                                style={{
+                                    color: r.color || '#1e293b',
+                                    fontSize: Math.max((r.fontSize || 24) * scale, 6),
+                                    display: 'inline-block',
+                                    verticalAlign: 'middle'
+                                }}
+                                dangerouslySetInnerHTML={{ __html: r.mathml }}
+                            />
+                        ) : (
+                            <span
+                                key={j}
+                                style={{
+                                    color: r.color || '#1e293b',
+                                    fontSize: Math.max((r.fontSize || 24) * scale, 6),
+                                    fontWeight: r.bold ? 700 : 400,
+                                    fontStyle: r.italic ? 'italic' : 'normal',
+                                    fontFamily: r.font ? `"${r.font}", ${PPT_FALLBACK_FONTS}` : PPT_FALLBACK_FONTS,
+                                    textDecorationLine: [r.underline ? 'underline' : '', r.strike ? 'line-through' : ''].join(' ').trim() || undefined
+                                }}
+                            >
+                                {r.text}
+                            </span>
+                        )
                     ))}
                 </div>
             );
