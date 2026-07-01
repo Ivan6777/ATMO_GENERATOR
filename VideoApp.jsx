@@ -330,13 +330,37 @@ const ANIMATION_OPTION_GROUPS = [
 ];
 
 const IMAGE_MIME_BY_EXT = {
-    png: 'image/png',
-    jpg: 'image/jpeg',
-    jpeg: 'image/jpeg',
+    png: 'image/png', apng: 'image/apng',
+    jpg: 'image/jpeg', jpeg: 'image/jpeg', jpe: 'image/jpeg', jfif: 'image/jpeg', pjpeg: 'image/jpeg', pjp: 'image/jpeg',
     gif: 'image/gif',
-    bmp: 'image/bmp',
+    bmp: 'image/bmp', dib: 'image/bmp',
     webp: 'image/webp',
-    svg: 'image/svg+xml'
+    svg: 'image/svg+xml',
+    ico: 'image/x-icon', cur: 'image/x-icon',
+    tif: 'image/tiff', tiff: 'image/tiff',
+    avif: 'image/avif',
+    heic: 'image/heic', heif: 'image/heif'
+};
+// Визначення формату за магічними байтами — для файлів без/з хибним розширенням
+const sniffImageMime = (b) => {
+    if (!b || b.length < 12) return null;
+    if (b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4E && b[3] === 0x47) return 'image/png';
+    if (b[0] === 0xFF && b[1] === 0xD8 && b[2] === 0xFF) return 'image/jpeg';
+    if (b[0] === 0x47 && b[1] === 0x49 && b[2] === 0x46) return 'image/gif';
+    if (b[0] === 0x42 && b[1] === 0x4D) return 'image/bmp';
+    if (b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46
+        && b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50) return 'image/webp';
+    if (b[0] === 0x00 && b[1] === 0x00 && b[2] === 0x01 && b[3] === 0x00) return 'image/x-icon';
+    if ((b[0] === 0x49 && b[1] === 0x49 && b[2] === 0x2A) || (b[0] === 0x4D && b[1] === 0x4D && b[3] === 0x2A)) return 'image/tiff';
+    if (b[4] === 0x66 && b[5] === 0x74 && b[6] === 0x79 && b[7] === 0x70) { // ISO BMFF "ftyp" -> AVIF/HEIC
+        const brand = String.fromCharCode(b[8], b[9], b[10], b[11]);
+        if (brand.startsWith('avif') || brand.startsWith('avis')) return 'image/avif';
+        if (brand.startsWith('heic') || brand.startsWith('heix') || brand.startsWith('mif1')) return 'image/heic';
+    }
+    let head = '';
+    for (let i = 0; i < Math.min(b.length, 256); i++) head += String.fromCharCode(b[i]);
+    if (head.includes('<svg') || (head.trimStart().startsWith('<?xml') && head.includes('svg'))) return 'image/svg+xml';
+    return null;
 };
 
 // Відео, вбудовані у слайди PPTX (p:pic з a:videoFile) -> MIME для blob-відтворення
@@ -1192,13 +1216,41 @@ const buildStyleDirection = (rate, style) => [TTS_RATES[rate] || '', TTS_STYLES[
 // емодзі, обидва скрипти разом) лишаємо голос як обрано вручну.
 const CYRILLIC_RE = /[а-яёіїєґ]/i;
 const LATIN_RE = /[a-z]/i;
+// Авто-акцент за мовою тексту: українська -> "-UA", англійська -> "-UK" (British
+// English). Мова визначається за ДОМІНАНТНИМ алфавітом, тому кілька латинських
+// термінів в українському реченні не перемикають голос. Свідомо обраний німецький
+// голос (-DE) зберігається для не-кириличного тексту.
 const pickVoiceForText = (voiceSelection, text) => {
     const baseName = voiceSelection.replace(/-(UK|UA|DE)$/, '');
-    const hasCyrillic = CYRILLIC_RE.test(text || '');
-    const hasLatin = LATIN_RE.test(text || '');
-    if (hasCyrillic && !hasLatin) return `${baseName}-UA`;
-    if (hasLatin && !hasCyrillic) return `${baseName}-UK`;
-    return voiceSelection;
+    const cyr = (String(text || '').match(/[а-яёіїєґ]/gi) || []).length;
+    const lat = (String(text || '').match(/[a-z]/gi) || []).length;
+    if (!cyr && !lat) return voiceSelection;
+    if (voiceSelection.endsWith('-DE') && !cyr) return voiceSelection;
+    return cyr >= lat ? `${baseName}-UA` : `${baseName}-UK`;
+};
+
+// Розбиває текст диктора на однорідні за мовою фрагменти (по реченнях):
+// українські речення озвучуються українським голосом, англійські — британською
+// англійською, навіть коли вони чергуються в межах одного слайда
+const splitTextByLanguage = (text) => {
+    const sentences = String(text || '').match(/[^.!?…\n]+[.!?…]*[\s]*/g);
+    if (!sentences || sentences.length < 2) return [{ text: String(text || '') }];
+    const langOf = (s) => {
+        const cyr = (s.match(/[а-яёіїєґ]/gi) || []).length;
+        const lat = (s.match(/[a-z]/gi) || []).length;
+        if (!cyr && !lat) return null; // лише цифри/розділові — приєднуємо до сусіднього
+        return cyr >= lat ? 'uk' : 'en';
+    };
+    const out = [];
+    for (const s of sentences) {
+        const lang = langOf(s);
+        const last = out[out.length - 1];
+        if (!last) { out.push({ text: s, lang }); continue; }
+        if (lang === null || last.lang === lang) last.text += s;
+        else if (last.lang === null) { last.text += s; last.lang = lang; }
+        else out.push({ text: s, lang });
+    }
+    return out.filter(p => p.text.trim());
 };
 
 const fetchTTSWithRetry = async (textToSpeak, voiceSelection, styleDirection = '', retries = 5) => {
@@ -1586,17 +1638,22 @@ const extractPptxData = async (file) => {
         return new URL(target, `https://x/${basePath}`).pathname.replace(/^\//, '');
     };
 
-    // Витягує зображення за embedId відносно довільного XML-файла пакета -> dataURL
+    // Витягує зображення за embedId відносно довільного XML-файла пакета -> dataURL.
+    // Формат визначається розширенням, а якщо воно невідоме/хибне — магічними
+    // байтами вмісту (тому підтримуються й файли типу image1.dat з PNG усередині).
     const resolveImageIn = async (relsDoc, basePath, embedId) => {
         if (!embedId || !relsDoc) return null;
         const imgRel = relsDoc.querySelector(`Relationship[Id="${embedId}"]`);
         if (!imgRel) return null;
         const imgTarget = resolveTarget(basePath, imgRel.getAttribute('Target'));
-        const ext = imgTarget.split('.').pop().toLowerCase();
-        const mime = IMAGE_MIME_BY_EXT[ext];
-        if (!mime) return null;
         const imgFile = zip.file(imgTarget);
         if (!imgFile) return null;
+        const ext = imgTarget.split('.').pop().toLowerCase();
+        let mime = IMAGE_MIME_BY_EXT[ext];
+        if (!mime) {
+            try { mime = sniffImageMime(await imgFile.async('uint8array')); } catch (e) { /* ignore */ }
+        }
+        if (!mime) return null; // векторні EMF/WMF браузер не декодує — буде плейсхолдер
         return `data:${mime};base64,${await imgFile.async('base64')}`;
     };
 
@@ -1953,6 +2010,10 @@ const extractPptxData = async (file) => {
                     const blipFill = getDirectChild(node, 'p:blipFill', 'blipFill');
                     const blip = blipFill ? getDirectChild(blipFill, 'a:blip', 'blip') : null;
                     const embedId = blip ? (blip.getAttribute('r:embed') || blip.getAttribute('embed')) : null;
+                    // SVG-версія зображення (a:extLst/asvg:svgBlip) — векторна, без втрат якості;
+                    // r:embed у такому разі вказує на растровий PNG-фолбек
+                    const svgBlip = blip ? Array.from(blip.getElementsByTagName('*')).find(e => e.localName === 'svgBlip') : null;
+                    const svgEmbedId = svgBlip ? (svgBlip.getAttribute('r:embed') || svgBlip.getAttribute('embed')) : null;
                     const srcRect = blipFill ? getDirectChild(blipFill, 'a:srcRect', 'srcRect') : null;
                     let crop = null;
                     if (srcRect) {
@@ -1992,8 +2053,19 @@ const extractPptxData = async (file) => {
                             continue;
                         }
                     }
-                    const src = await env.resolveImage(embedId);
+                    const src = (svgEmbedId ? await env.resolveImage(svgEmbedId) : null)
+                        || await env.resolveImage(embedId);
                     if (src && rect) env.objects.push({ ...baseObject, type: 'image', src, crop, cornerRadius, ...rect });
+                    else if (rect && embedId) {
+                        // Формат, який браузер не декодує (EMF/WMF тощо) — інформативний
+                        // плейсхолдер замість мовчазного зникнення зображення
+                        env.objects.push({
+                            ...baseObject, type: 'text', ...rect,
+                            fillColor: '#F1F5F9', lineColor: '#CBD5E1', lineWidth: 1, lineDash: null,
+                            vAlign: 'ctr',
+                            lines: [{ text: '[Зображення: формат не підтримується браузером]', color: '#64748B', fontSize: Math.round(ptToPx(11)), bold: false, italic: true, align: 'ctr', indent: 0 }]
+                        });
+                    }
                     continue;
                 }
 
@@ -2285,6 +2357,22 @@ const extractPptxData = async (file) => {
     }
 
     if (extractedSlides.length === 0) throw new Error("У презентації не знайдено слайдів");
+
+    // Розігрів кеша відео одразу після імпорту (у фоні): блоби вже в пам'яті,
+    // <video>-елементи створюємо і декодуємо заздалегідь — перший показ слайда
+    // з відео стартує миттєво, без паузи на завантаження/сік
+    const videoSrcsToWarm = new Set();
+    for (const s of extractedSlides) {
+        for (const o of s.objects || []) {
+            if ((o.type === 'video' || o.type === 'audio') && o.src) videoSrcsToWarm.add(o.src);
+        }
+    }
+    if (videoSrcsToWarm.size && typeof document !== 'undefined') {
+        Promise.all(Array.from(videoSrcsToWarm).map(src => loadVideo(src))).then(() => {
+            logChange('Імпорт', `Відео підготовлено до відтворення: ${videoSrcsToWarm.size}`);
+        }).catch(() => { /* ignore */ });
+    }
+
     logChange('Імпорт', `Розібрано презентацію: ${extractedSlides.length} слайд(ів)`, {
         slides: extractedSlides.length,
         embeddedFonts: embeddedFontFamilies.length,
@@ -3921,9 +4009,13 @@ export default function VideoEditor() {
                     sampleRate = sr;
                 }
 
-                const res = await fetchTTSWithRetry(seg.text, pickVoiceForText(vp.voice, seg.text), buildStyleDirection(vp.rate, vp.style));
-                parts.push(res.base64);
-                sampleRate = res.sampleRate;
+                // Двомовний текст озвучуємо фрагментами: кожне речення — голосом своєї
+                // мови (укр -> український, англ -> британська англійська)
+                for (const langPart of splitTextByLanguage(seg.text)) {
+                    const res = await fetchTTSWithRetry(langPart.text, pickVoiceForText(vp.voice, langPart.text), buildStyleDirection(vp.rate, vp.style));
+                    parts.push(res.base64);
+                    sampleRate = res.sampleRate;
+                }
             }
             base64 = concatPcmBase64(parts);
 
@@ -5439,7 +5531,7 @@ export default function VideoEditor() {
             const frag = (ts || te) ? `#t=${ts}${te ? ',' + te : ''}` : '';
             const cr = obj.crop && (obj.crop.l || obj.crop.t || obj.crop.r || obj.crop.b) ? obj.crop : null;
             const videoEl = (extra) => (
-                <video src={obj.src + frag} poster={obj.poster || undefined} controls playsInline
+                <video src={obj.src + frag} poster={obj.poster || undefined} controls playsInline preload="auto"
                     onMouseDown={(e) => e.stopPropagation()} className="select-none bg-black" style={extra} />
             );
             if (cr) {
@@ -5838,17 +5930,83 @@ export default function VideoEditor() {
                                 value={(obj.lines || []).map(l => l.text).join('\n')}
                                 onChange={(e) => {
                                     const base = obj.lines?.[0] || { color: '#1e293b', fontSize: 24, bold: false, align: 'l' };
-                                    // Ручне редагування скидає руни рядка — далі рядок рендериться зі стилів рядка
-                                    const newLines = e.target.value.split('\n').map((t, i) => ({
-                                        ...(obj.lines?.[i] || base),
-                                        text: t,
-                                        runs: undefined,
-                                        bullet: undefined
-                                    }));
+                                    // Незмінені рядки лишаємо як є (руни, формули й стилі збережено);
+                                    // руни скидаються лише в реально відредагованих рядках
+                                    const newLines = e.target.value.split('\n').map((t, i) => {
+                                        const prev = obj.lines?.[i];
+                                        if (prev && prev.text === t) return prev;
+                                        return { ...(prev || base), text: t, runs: undefined, bullet: undefined };
+                                    });
                                     updateObj({ lines: newLines });
                                 }}
                                 className="w-full min-h-[70px] p-2 text-xs border border-slate-200 rounded-lg outline-none focus:border-indigo-400 resize-y bg-white"
                             />
+                            {/* Форматування: стиль шрифту, горизонтальне та вертикальне вирівнювання */}
+                            {(() => {
+                                // Стан тумблера — за першим стильованим руном/рядком об'єкта
+                                const allRuns = (obj.lines || []).flatMap(l => (l.runs && l.runs.length ? l.runs : [l])).filter(r => !r.math);
+                                const st = (k) => allRuns.length > 0 && allRuns.every(r => !!r[k]);
+                                // Стильовий патч на всі рядки й руни (формули-руни не чіпаємо)
+                                const setTextStyle = (patch) => updateObj({
+                                    lines: (obj.lines || []).map(l => ({
+                                        ...l, ...patch,
+                                        runs: l.runs ? l.runs.map(r => (r.math ? r : { ...r, ...patch })) : l.runs
+                                    }))
+                                });
+                                const setAlign = (align) => updateObj({ lines: (obj.lines || []).map(l => ({ ...l, align })) });
+                                const tgl = (on) => `px-2 py-1 text-xs font-bold rounded border ${on ? 'bg-indigo-100 border-indigo-300 text-indigo-700' : 'bg-white border-slate-200 text-slate-500 hover:bg-slate-50'}`;
+                                const curAlign = obj.lines?.[0]?.align || 'l';
+                                const fontList = [...new Set([
+                                    ...(obj.lines || []).flatMap(l => (l.runs || []).map(r => r.font)).filter(Boolean),
+                                    ...embeddedFontFamilies, // вбудовані шрифти імпортованої презентації
+                                    'Calibri', 'Arial', 'Times New Roman', 'Georgia', 'Verdana', 'Tahoma',
+                                    'Trebuchet MS', 'Comic Sans MS', 'Courier New', 'Impact'
+                                ])];
+                                const curFont = obj.lines?.[0]?.runs?.[0]?.font || obj.lines?.[0]?.font || '';
+                                return (
+                                    <>
+                                        <div className="flex flex-wrap items-center gap-1">
+                                            <button className={tgl(st('bold'))} style={{ fontWeight: 800 }} title="Жирний"
+                                                onClick={() => setTextStyle({ bold: !st('bold') })}>B</button>
+                                            <button className={tgl(st('italic'))} style={{ fontStyle: 'italic' }} title="Курсив"
+                                                onClick={() => setTextStyle({ italic: !st('italic') })}>I</button>
+                                            <button className={tgl(st('underline'))} style={{ textDecoration: 'underline' }} title="Підкреслений"
+                                                onClick={() => setTextStyle({ underline: !st('underline') })}>U</button>
+                                            <button className={tgl(st('strike'))} style={{ textDecoration: 'line-through' }} title="Закреслений"
+                                                onClick={() => setTextStyle({ strike: !st('strike') })}>S</button>
+                                            <span className="w-px h-5 bg-slate-200 mx-1" />
+                                            {[['l', 'Л', 'Ліворуч'], ['ctr', 'Ц', 'По центру'], ['r', 'П', 'Праворуч']].map(([a, ic, tip]) => (
+                                                <button key={a} className={tgl(curAlign === a)} title={tip}
+                                                    onClick={() => setAlign(a)}>{ic}</button>
+                                            ))}
+                                            <span className="w-px h-5 bg-slate-200 mx-1" />
+                                            {[['t', 'В', 'Догори'], ['ctr', 'С', 'Посередині'], ['b', 'Н', 'Донизу']].map(([va, ic, tip]) => (
+                                                <button key={va} className={tgl((obj.vAlign || 't') === va)} title={tip}
+                                                    onClick={() => updateObj({ vAlign: va })}>{ic}</button>
+                                            ))}
+                                        </div>
+                                        <label className="flex items-center gap-2 text-[11px] font-semibold text-slate-500">
+                                            Шрифт
+                                            <select
+                                                value={curFont}
+                                                onChange={(e) => {
+                                                    const f = e.target.value || null;
+                                                    updateObj({
+                                                        lines: (obj.lines || []).map(l => ({
+                                                            ...l, font: f,
+                                                            runs: l.runs ? l.runs.map(r => (r.math ? r : { ...r, font: f })) : l.runs
+                                                        }))
+                                                    });
+                                                }}
+                                                className="flex-1 px-1.5 py-1 text-xs border border-slate-200 rounded-lg outline-none focus:border-indigo-400 bg-white"
+                                            >
+                                                <option value="">(тема)</option>
+                                                {fontList.map(f => <option key={f} value={f}>{f}</option>)}
+                                            </select>
+                                        </label>
+                                    </>
+                                );
+                            })()}
                             <div className="grid grid-cols-2 gap-2">
                                 <label className="flex items-center gap-2 text-[11px] font-semibold text-slate-500">
                                     Колір
