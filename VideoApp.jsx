@@ -2427,7 +2427,13 @@ const loadVideo = (src) => new Promise((resolve) => {
 const videoAudioSources = new WeakMap();
 const videoStartTimers = new WeakMap();
 // Грати відео слайду зі звуком. mix={audioCtx,dest} — підмішати аудіо у трек експорту.
+// Повертає проміс готовності: резолвиться, коли всі відео зі стартом на початку
+// слайда РЕАЛЬНО почали відтворюватись (подія 'playing'). Експорт чекає на нього
+// перед запуском озвучки та годинника кадрів — інакше звук стартує миттєво, а
+// перший кадр відео з'являється на 100-300мс пізніше, і картинка вбудованого
+// відео зміщується відносно його звукової доріжки на весь слайд.
 const playSlideVideos = (slide, mix) => {
+    const readiness = [];
     (slide?.objects || []).filter(o => (o.type === 'video' || o.type === 'audio') && o.src).forEach(o => {
         const v = videoCache.get(o.src);
         if (!v) return;
@@ -2493,14 +2499,32 @@ const playSlideVideos = (slide, mix) => {
                         videoAudioSources.set(v, { node });
                     }
                 }
-                const p = v.play(); if (p && p.catch) p.catch(() => { });
+                const p = v.play();
+                if (p && p.catch) p.catch(() => {
+                    // Автовідтворення зі звуком відхилено (на довгому експорті браузер
+                    // "забуває" активацію користувача) — повторюємо беззвучно, щоб
+                    // картинка не завмирала; captureStream і далі віддає аудіодоріжку
+                    v.muted = true;
+                    const p2 = v.play();
+                    if (p2 && p2.catch) p2.catch(() => { });
+                });
             } catch (e) { /* ignore */ }
         };
         // Старт за obj.animation.delay — AI-анімація вирішує, КОЛИ відео програється
         const delayMs = Math.max(0, (o.animation && o.animation.delay ? o.animation.delay : 0) * 1000);
         if (delayMs > 50) { const id = setTimeout(startNow, delayMs); videoStartTimers.set(v, id); }
-        else startNow();
+        else {
+            readiness.push(new Promise(resolve => {
+                let done = false;
+                const finish = () => { if (!done) { done = true; v.removeEventListener('playing', finish); resolve(); } };
+                v.addEventListener('playing', finish);
+                setTimeout(finish, 1500); // фолбек: зіпсоване відео не блокує експорт
+                startNow();
+                if (!v.paused && v.readyState >= 3) finish(); // уже грає
+            }));
+        }
     });
+    return Promise.all(readiness);
 };
 const stopSlideVideos = (slide) => {
     (slide?.objects || []).filter(o => (o.type === 'video' || o.type === 'audio') && o.src).forEach(o => {
@@ -4983,7 +5007,7 @@ export default function VideoEditor() {
         setIsPreviewing(true);
 
         // Малювання починаємо після монтування canvas (наступний тік)
-        setTimeout(() => {
+        setTimeout(async () => {
             const canvas = previewCanvasRef.current;
             if (!canvas) { setIsPreviewing(false); return; }
             const ctx = canvas.getContext('2d');
@@ -4992,6 +5016,11 @@ export default function VideoEditor() {
             let rafId = null;
             let source = null;
             let bgAudioEl = null;
+
+            // Спершу відео (чекаємо реального старту кадрів), потім озвучка й годинник —
+            // інакше звук випереджає картинку вбудованого відео на час його декодування
+            await primeSlideVideos(slide);
+            await playSlideVideos(slide);
 
             if (slide.audioBase64) {
                 if (!currentCtx) currentCtx = new (window.AudioContext || window.webkitAudioContext)();
@@ -5007,8 +5036,6 @@ export default function VideoEditor() {
                 bgAudioEl.crossOrigin = 'anonymous';
                 bgAudioEl.play().catch(e => console.error("Preview bgAudio play error:", e));
             }
-
-            playSlideVideos(slide); // відтворюємо вбудовані відео слайду
 
             const cleanup = () => {
                 if (rafId) cancelAnimationFrame(rafId);
@@ -5127,6 +5154,42 @@ export default function VideoEditor() {
 
     // --- Експорт відео: кадри через canvas.captureStream + аудіо через MediaRecorder ---
 
+    // Годинник кадрів експорту на таймері Web Worker: таймери воркерів НЕ
+    // тротляться у фонових вкладках. Звичайний setTimeout у прихованій вкладці
+    // спрацьовує щонайбільше раз на секунду — canvas завмирав, а звук
+    // (captureStream пише в реальному часі) продовжував записуватись, тому
+    // картинка вбудованих відео зміщувалась відносно їх звукової доріжки на
+    // весь час, поки вкладка була у фоні. З воркером кадри малюються вчасно
+    // навіть у згорнутому/фоновому вікні.
+    const createExportClock = () => {
+        let worker = null;
+        const waiters = new Set();
+        try {
+            const url = URL.createObjectURL(new Blob(
+                ['let t=setInterval(()=>postMessage(0),8);onmessage=e=>{if(e.data==="stop")clearInterval(t);};'],
+                { type: 'application/javascript' }
+            ));
+            worker = new Worker(url);
+            URL.revokeObjectURL(url);
+            worker.onmessage = () => { for (const w of Array.from(waiters)) w(); };
+        } catch (e) { worker = null; /* фолбек нижче — setTimeout */ }
+        return {
+            waitUntil: (deadlineMs) => new Promise(resolve => {
+                let done = false;
+                const finish = () => {
+                    if (!done && performance.now() >= deadlineMs) { done = true; waiters.delete(finish); resolve(); }
+                };
+                waiters.add(finish);
+                setTimeout(() => { if (!done) { done = true; waiters.delete(finish); resolve(); } }, Math.max(0, deadlineMs - performance.now()));
+                finish();
+            }),
+            dispose: () => {
+                try { if (worker) { worker.postMessage('stop'); worker.terminate(); } } catch (e) { /* ignore */ }
+                waiters.clear();
+            }
+        };
+    };
+
     // opts: { withAudio } — withAudio:false → відео без звуку
     const handleExportVideo = async (opts = {}) => {
         if (slides.length === 0) return;
@@ -5145,6 +5208,7 @@ export default function VideoEditor() {
         let stream = null;
         let audioCtx = null;
         let recorder = null;
+        let exportClock = null;
 
         try {
             // Попередньо завантажуємо всі зображення/відео всіх слайдів
@@ -5197,7 +5261,7 @@ export default function VideoEditor() {
             recorder.start();
 
             const fps = 30;
-            const wait = ms => new Promise(r => setTimeout(r, Math.max(0, ms)));
+            exportClock = createExportClock();
             // Кадри малюються за РЕАЛЬНИМ часом (performance.now()), а не фіксованою
             // кількістю ітерацій із незмінною паузою between них. Раніше пауза між
             // кадрами (1000/fps) додавалась ПОВЕРХ часу, витраченого на саме
@@ -5208,6 +5272,8 @@ export default function VideoEditor() {
             // звуку — саме це й спричиняло розсинхрон озвучки з відео на слайдах.
             // Малюючи кожен кадр рівно для того часу, який справді минув, картинка
             // завжди відповідає тому, що в цей момент реально звучить/програється.
+            // Пауза між кадрами — через exportClock (Web Worker), який не
+            // тротлиться у фонових вкладках.
             const drawTimed = async (durationSec, drawFn) => {
                 const start = performance.now();
                 let frame = 0;
@@ -5217,7 +5283,7 @@ export default function VideoEditor() {
                     drawFn(t, frame);
                     if (elapsed >= durationSec) break;
                     frame++;
-                    await wait(start + frame * (1000 / fps) - performance.now());
+                    await exportClock.waitUntil(start + frame * (1000 / fps));
                 }
             };
 
@@ -5256,10 +5322,12 @@ export default function VideoEditor() {
                     });
                 }
 
-                // Відео запускаємо ПЕРШИМ (у play() трохи більша затримка старту), а
-                // одразу за ним — озвучку (миттєвий AudioBufferSourceNode), щоб картинка
-                // й звук збіглися.
-                playSlideVideos(slide, withAudio ? { audioCtx, dest } : undefined); // відео в кадр (+ аудіо у трек, якщо зі звуком)
+                // Відео запускаємо ПЕРШИМ і ЧЕКАЄМО події 'playing' (перший кадр реально
+                // йде) — лише тоді стартуємо озвучку (миттєвий AudioBufferSourceNode) та
+                // годинник кадрів. Без цього звук починався одразу, а картинка відео —
+                // на 100-300мс пізніше (декодування), і вбудоване відео до кінця слайда
+                // йшло зі зміщеною відносно свого звуку картинкою.
+                await playSlideVideos(slide, withAudio ? { audioCtx, dest } : undefined); // відео в кадр (+ аудіо у трек, якщо зі звуком)
 
                 // Старт озвучки слайду (лише якщо експорт зі звуком)
                 if (ttsSource) {
@@ -5329,6 +5397,7 @@ export default function VideoEditor() {
             if (audioCtx) {
                 try { if (audioCtx.state !== 'closed') audioCtx.close(); } catch (e) { /* ignore */ }
             }
+            if (exportClock) { try { exportClock.dispose(); } catch (e) { /* ignore */ } }
             isVideoExportingRef.current = false;
             setIsExporting(false);
             setExportProgress(0);
