@@ -400,14 +400,52 @@ const mmlOn = (el, defWhenMissing = false) => {
 };
 const mmlChild = (el, ln) => (el ? Array.from(el.children).find(c => c.localName === ln) : null);
 const mmlChildren = (el, ln) => (el ? Array.from(el.children).filter(c => c.localName === ln) : []);
+
+// ── Нормалізація Mathematical Alphanumeric Symbols (U+1D400–U+1D7FF) ──
+// PowerPoint зберігає літери формул саме цими кодами (𝐴 = U+1D434), але шрифти
+// слайдів (Calibri тощо) не мають таких гліфів — без нормалізації замість літер
+// рендериться "ромб зі знаком питання". Згортаємо до базових літер, запам'ятовуючи
+// курсив/жирність стильового блоку (курсив і так типовий для <mi> у MathML).
+const MATH_GREEK_BASE = 'ΑΒΓΔΕΖΗΘΙΚΛΜΝΞΟΠΡϴΣΤΥΦΧΨΩ∇αβγδεζηθικλμνξοπρςστυφχψω∂ϵϑϰϕϱϖ';
+const foldMathChar = (cp) => {
+    if (cp >= 0x1D400 && cp <= 0x1D6A3) { // латиниця: 13 стилів × 52 літери (A-Z, a-z)
+        const off = cp - 0x1D400, i = off % 52, s = Math.floor(off / 52);
+        return {
+            ch: String.fromCharCode(i < 26 ? 65 + i : 97 + (i - 26)),
+            italic: [1, 2, 10, 11].includes(s), bold: [0, 2, 4, 7, 9, 11].includes(s)
+        };
+    }
+    if (cp >= 0x1D6A8 && cp <= 0x1D7CB) { // грецькі: 5 стилів × 58 символів
+        const off = cp - 0x1D6A8, i = off % 58, s = Math.floor(off / 58);
+        return { ch: Array.from(MATH_GREEK_BASE)[i] || '', italic: [1, 2, 4].includes(s), bold: [0, 2, 3, 4].includes(s) };
+    }
+    if (cp >= 0x1D7CE && cp <= 0x1D7FF) // цифри: 5 стилів × 10
+        return { ch: String.fromCharCode(48 + (cp - 0x1D7CE) % 10), italic: false, bold: cp - 0x1D7CE < 10 };
+    if (cp === 0x210E) return { ch: 'h', italic: true, bold: false }; // ℎ (Planck)
+    return null;
+};
+// Згортає рядок; повертає текст + чи траплялися курсивні/жирні math-літери
+const foldMathText = (s) => {
+    let text = '', italic = false, bold = false, folded = false;
+    for (const ch of Array.from(String(s || ''))) {
+        const f = foldMathChar(ch.codePointAt(0));
+        if (f) { text += f.ch; italic = italic || f.italic; bold = bold || f.bold; folded = true; }
+        else text += ch;
+    }
+    return { text, italic, bold, folded };
+};
+const normalizeMathText = (s) => foldMathText(s).text;
+
 const ommlTokens = (txt) => {
     let o = '';
-    // Числа групуємо в один <mn> (12.5 — один токен), літери -> <mi>, решта -> <mo>
-    const parts = String(txt || '').match(/\d+(?:[.,]\d+)*|\s+|[\s\S]/g) || [];
+    // Числа групуємо в один <mn> (12.5 — один токен), літери -> <mi>, решта -> <mo>.
+    // Прапорець u обов'язковий: без нього [\s\S] розриває сурогатні пари астральних
+    // символів (𝐴 тощо) і замість літери виходить пошкоджений символ.
+    const parts = normalizeMathText(txt).match(/\d+(?:[.,]\d+)*|\s+|[\s\S]/gu) || [];
     for (const p of parts) {
         if (/^\s+$/.test(p)) o += '<mspace width="0.25em"/>';
         else if (/^\d/.test(p)) o += `<mn>${xmlEscMath(p)}</mn>`;
-        else if (/^[A-Za-zА-Яа-яЁёІіЇїЄєҐґΑ-Ωα-ω∞ℏ∂∇]$/.test(p)) o += `<mi>${xmlEscMath(p)}</mi>`;
+        else if (/^[A-Za-zА-Яа-яЁёІіЇїЄєҐґΑ-Ωα-ωϴϵϑϰϕϱϖ∞ℏ∂∇]$/u.test(p)) o += `<mi>${xmlEscMath(p)}</mi>`;
         else if (p === '-') o += '<mo>−</mo>';
         else o += `<mo>${xmlEscMath(p)}</mo>`;
     }
@@ -424,7 +462,7 @@ const ommlRun = (r) => {
     const txt = mmlChildren(r, 't').map(t => t.textContent).join('');
     // m:brk у rPr — примусовий розрив рядка формули
     let out = rPr && mmlChild(rPr, 'brk') ? '<mspace linebreak="newline"/>' : '';
-    if (rPr && mmlOn(mmlChild(rPr, 'nor'))) return out + `<mtext>${xmlEscMath(txt)}</mtext>`;
+    if (rPr && mmlOn(mmlChild(rPr, 'nor'))) return out + `<mtext>${xmlEscMath(normalizeMathText(txt))}</mtext>`;
     const sty = mmlVal(mmlChild(rPr, 'sty'), null);
     const scr = mmlVal(mmlChild(rPr, 'scr'), null);
     const variant = (scr && MML_SCR_VARIANT[scr]) || (sty && MML_STY_VARIANT[sty]) || null;
@@ -559,8 +597,8 @@ const ommlToLinear = (el) => {
         const ln = c.localName;
         if (ln.endsWith('Pr')) continue;
         switch (ln) {
-            case 'r': out += mmlChildren(c, 't').map(t => t.textContent).join(''); break;
-            case 't': out += c.textContent; break;
+            case 'r': out += normalizeMathText(mmlChildren(c, 't').map(t => t.textContent).join('')); break;
+            case 't': out += normalizeMathText(c.textContent); break;
             case 'f': out += `${linWrap(child(c, 'num'))}/${linWrap(child(c, 'den'))}`; break;
             case 'sSup': out += child(c, 'e') + sup(child(c, 'sup')); break;
             case 'sSub': out += child(c, 'e') + sub(child(c, 'sub')); break;
@@ -932,7 +970,7 @@ const getRenderRuns = (line) => {
     return runs;
 };
 
-const PPT_FALLBACK_FONTS = '"Calibri", "Arial", "Segoe UI", "Helvetica Neue", "Segoe UI Emoji", "Segoe UI Symbol", "Apple Color Emoji", "Noto Color Emoji", sans-serif';
+const PPT_FALLBACK_FONTS = '"Calibri", "Arial", "Segoe UI", "Helvetica Neue", "Segoe UI Emoji", "Segoe UI Symbol", "Cambria Math", "STIX Two Math", "Noto Sans Math", "Apple Color Emoji", "Noto Color Emoji", sans-serif';
 
 const buildRunFont = (r) =>
     `${r.italic ? 'italic ' : ''}${r.bold ? 'bold ' : ''}${r.fontSize || 24}px ${r.font ? `"${r.font}", ` : ''}${PPT_FALLBACK_FONTS}`;
@@ -1456,7 +1494,15 @@ const extractTextLines = (txBody, ptToPx, defaults = {}) => {
                 }
 
                 if (!runText) continue;
-                chunks[chunks.length - 1].push({ ...readRunStyle(runPr), text: runText });
+                // Math-літери (𝐴𝐵𝐶, U+1D400+) у звичайному тексті: згортаємо до базових
+                // (шрифти слайдів не мають цих гліфів), стиль блоку -> курсив/жирність руна
+                const foldedRun = foldMathText(runText);
+                const runStyle = readRunStyle(runPr);
+                if (foldedRun.folded) {
+                    runStyle.italic = runStyle.italic || foldedRun.italic;
+                    runStyle.bold = runStyle.bold || foldedRun.bold;
+                }
+                chunks[chunks.length - 1].push({ ...runStyle, text: foldedRun.text });
             } else if (child.tagName === 'a:br' || child.tagName === 'br') {
                 chunks.push([]);
             }
