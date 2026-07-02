@@ -1,4 +1,537 @@
 import React, { useState, useReducer, useRef, useEffect, useCallback } from 'react';
+
+/* ============================================================================
+ * 0. UXKit — UI/UX-примітиви (Спринти 1–2 з UX_UPDATES_CHECKLIST.md)
+ *
+ * Секція самодостатня (лише React): токени дизайн-системи, тости
+ * з кнопкою дії (undo-снекбари), модал гарячих клавіш, автозбереження проєкту
+ * в IndexedDB (включно з блобами відео/аудіо), банер відновлення сесії,
+ * оверлей прогресу імпорту, чекліст готовності до експорту та валідація PPTX.
+ *
+ * Покриває: U-01, U-02, U-03, U-04, U-07, U-08, U-17, U-18, U-19, U-21,
+ *           U-22, U-70, U-71, U-72, U-73, U-94 (базові токени).
+ * ========================================================================== */
+
+/* ── U-94. Токени дизайн-системи ── */
+const TOKENS = {
+    primary: '#7c3aed',
+    primaryHover: '#6d28d9',
+    success: '#059669',
+    danger: '#dc2626',
+    textMain: '#1e293b',
+    textMuted: '#64748b',
+    border: '#e2e8f0',
+    surface: '#ffffff',
+    surfaceAlt: '#f8fafc',
+    radiusS: 8,
+    radiusM: 12
+};
+
+/* ── U-18. Система тостів (глобальна шина, без контексту — сумісно з
+ *    babel-standalone). toast('success'|'error'|'info', 'текст', { action }) ── */
+let __toastId = 0;
+const __toastListeners = new Set();
+
+const toast = (type, message, opts = {}) => {
+    const t = {
+        id: ++__toastId,
+        type,
+        message,
+        action: opts.action || null, // { label, onClick } — напр. «Повернути» (U-07/U-08)
+        duration: opts.duration != null ? opts.duration : (opts.action ? 6000 : 3500)
+    };
+    __toastListeners.forEach(fn => fn(t));
+    return t.id;
+};
+
+const ToastHost = () => {
+    const [items, setItems] = React.useState([]);
+    React.useEffect(() => {
+        const onToast = (t) => {
+            setItems(list => [...list.slice(-3), t]);
+            if (t.duration > 0) {
+                setTimeout(() => setItems(list => list.filter(x => x.id !== t.id)), t.duration);
+            }
+        };
+        __toastListeners.add(onToast);
+        return () => __toastListeners.delete(onToast);
+    }, []);
+    const dismiss = (id) => setItems(list => list.filter(x => x.id !== id));
+    const ICON = { success: '✓', error: '⚠', info: 'ℹ' };
+    const BG = { success: '#059669', error: '#dc2626', info: '#1e293b' };
+    return (
+        <div
+            className="fixed bottom-4 left-1/2 -translate-x-1/2 z-[100] flex flex-col items-center gap-2 pointer-events-none"
+            aria-live="polite"
+        >
+            {items.map(t => (
+                <div
+                    key={t.id}
+                    className="text-white rounded-xl shadow-2xl px-4 py-2.5 text-xs font-semibold flex items-center gap-3 pointer-events-auto max-w-[80vw]"
+                    style={{ backgroundColor: BG[t.type] || BG.info }}
+                >
+                    <span aria-hidden="true">{ICON[t.type] || ''}</span>
+                    <span>{t.message}</span>
+                    {t.action && (
+                        <button
+                            onClick={() => { try { t.action.onClick(); } finally { dismiss(t.id); } }}
+                            className="underline font-bold text-white/90 hover:text-white whitespace-nowrap"
+                        >
+                            {t.action.label}
+                        </button>
+                    )}
+                    <button onClick={() => dismiss(t.id)} aria-label="Закрити сповіщення" className="text-white/60 hover:text-white ml-1">✕</button>
+                </div>
+            ))}
+        </div>
+    );
+};
+
+/* ── U-73. Клавіша у стилі клавіатури ── */
+const Kbd = ({ children }) => (
+    <kbd className="inline-block px-1.5 py-0.5 text-[10px] font-bold text-slate-600 bg-slate-100 border border-slate-300 rounded shadow-[0_1px_0_#cbd5e1] font-sans">
+        {children}
+    </kbd>
+);
+
+/* ── U-72. Модал гарячих клавіш (список — з реального keydown-обробника) ── */
+const SHORTCUTS = [
+    { keys: ['Ctrl', 'Z'], label: 'Скасувати останню дію' },
+    { keys: ['Ctrl', 'Y'], label: 'Повторити скасовану дію' },
+    { keys: ['Ctrl', 'C'], label: 'Копіювати виділені об\'єкти' },
+    { keys: ['Ctrl', 'V'], label: 'Вставити (також слайд/об\'єкт прямо з PowerPoint)' },
+    { keys: ['Ctrl', 'D'], label: 'Дублювати виділений об\'єкт' },
+    { keys: ['Delete'], label: 'Видалити виділені об\'єкти' },
+    { keys: ['Esc'], label: 'Зняти виділення' },
+    { keys: ['←', '↑', '→', '↓'], label: 'Посунути об\'єкт на 1 px' },
+    { keys: ['Shift', 'стрілки'], label: 'Посунути об\'єкт на 10 px' },
+    { keys: ['Shift', 'клік'], label: 'Додати об\'єкт до виділення' },
+    { keys: ['?'], label: 'Показати це вікно' }
+];
+
+const ShortcutsModal = ({ open, onClose }) => {
+    React.useEffect(() => {
+        if (!open) return;
+        const h = (e) => { if (e.key === 'Escape') onClose(); };
+        window.addEventListener('keydown', h);
+        return () => window.removeEventListener('keydown', h);
+    }, [open, onClose]);
+    if (!open) return null;
+    return (
+        <div className="fixed inset-0 z-[90] flex items-center justify-center" role="dialog" aria-modal="true" aria-label="Гарячі клавіші">
+            <div className="absolute inset-0 bg-black/40" onClick={onClose} />
+            <div className="relative bg-white rounded-2xl shadow-2xl w-[420px] max-w-[92vw] max-h-[80vh] overflow-y-auto p-5">
+                <div className="flex items-center justify-between mb-3">
+                    <h2 className="text-sm font-bold text-slate-800">Гарячі клавіші</h2>
+                    <button onClick={onClose} aria-label="Закрити" className="text-slate-400 hover:text-slate-600 p-1">✕</button>
+                </div>
+                <div className="space-y-2">
+                    {SHORTCUTS.map((s, i) => (
+                        <div key={i} className="flex items-center justify-between gap-3 text-xs text-slate-600">
+                            <span>{s.label}</span>
+                            <span className="flex items-center gap-1 flex-shrink-0">
+                                {s.keys.map((k, j) => (
+                                    <React.Fragment key={j}>
+                                        {j > 0 && <span className="text-slate-300">+</span>}
+                                        <Kbd>{k}</Kbd>
+                                    </React.Fragment>
+                                ))}
+                            </span>
+                        </div>
+                    ))}
+                </div>
+            </div>
+        </div>
+    );
+};
+
+/* ============================================================================
+ * U-01/U-02/U-03. Автозбереження проєкту в IndexedDB
+ * Блоби відео/аудіо (blob:-URL живуть лише до перезавантаження) зберігаються
+ * у сховищі "media" і при відновленні перетворюються назад на object-URL.
+ * ========================================================================== */
+const DB_NAME = 'atmo-studio-pro';
+const openDb = () => new Promise((resolve, reject) => {
+    const rq = indexedDB.open(DB_NAME, 1);
+    rq.onupgradeneeded = () => {
+        const db = rq.result;
+        if (!db.objectStoreNames.contains('project')) db.createObjectStore('project');
+        if (!db.objectStoreNames.contains('media')) db.createObjectStore('media');
+    };
+    rq.onsuccess = () => resolve(rq.result);
+    rq.onerror = () => reject(rq.error);
+});
+const idbReq = (db, store, mode, fn) => new Promise((resolve, reject) => {
+    const tx = db.transaction(store, mode);
+    const rq = fn(tx.objectStore(store));
+    tx.oncomplete = () => resolve(rq ? rq.result : undefined);
+    tx.onerror = () => reject(tx.error);
+});
+
+// Кеш "blob:-URL -> ключ у сховищі media" на сесію: великі відео не
+// перечитуються з пам'яті при кожному автозбереженні
+const __savedMediaKeys = new Map();
+
+const saveProjectSnapshot = async (slides) => {
+    const db = await openDb();
+    const serializable = [];
+    for (const s of slides) {
+        const objects = [];
+        for (const o of (s.objects || [])) {
+            if ((o.type === 'video' || o.type === 'audio') && o.src && o.src.startsWith('blob:')) {
+                let key = __savedMediaKeys.get(o.src);
+                if (!key) {
+                    try {
+                        const blob = await fetch(o.src).then(r => r.blob());
+                        key = 'media_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+                        await idbReq(db, 'media', 'readwrite', st => st.put(blob, key));
+                        __savedMediaKeys.set(o.src, key);
+                    } catch (e) { key = null; }
+                }
+                objects.push(key ? { ...o, src: 'idb:' + key } : { ...o, src: null });
+            } else {
+                objects.push(o);
+            }
+        }
+        serializable.push({ ...s, objects, isGenerating: false });
+    }
+    await idbReq(db, 'project', 'readwrite', st => st.put({ savedAt: Date.now(), slides: serializable }, 'autosave'));
+};
+
+const loadProjectSnapshot = async () => {
+    try {
+        const db = await openDb();
+        const snap = await idbReq(db, 'project', 'readonly', st => st.get('autosave'));
+        if (!snap || !snap.slides || !snap.slides.length) return null;
+        const slides = [];
+        for (const s of snap.slides) {
+            const objects = [];
+            for (const o of (s.objects || [])) {
+                if (o.src && typeof o.src === 'string' && o.src.startsWith('idb:')) {
+                    const blob = await idbReq(db, 'media', 'readonly', st => st.get(o.src.slice(4)));
+                    objects.push(blob ? { ...o, src: URL.createObjectURL(blob) } : { ...o, src: null });
+                } else {
+                    objects.push(o);
+                }
+            }
+            slides.push({ ...s, objects });
+        }
+        return { slides, savedAt: snap.savedAt };
+    } catch (e) {
+        return null;
+    }
+};
+
+const clearProjectSnapshot = async () => {
+    try {
+        const db = await openDb();
+        await idbReq(db, 'project', 'readwrite', st => st.clear());
+        await idbReq(db, 'media', 'readwrite', st => st.clear());
+        __savedMediaKeys.clear();
+    } catch (e) { /* ignore */ }
+};
+
+// U-01/U-04. Дебаунс-автозбереження; повертає стан для індикатора в топбарі
+// та dirtyRef для beforeunload-запобіжника
+const useAutosave = (slides, enabled = true) => {
+    const [state, setState] = React.useState({ status: 'idle', savedAt: null });
+    const timerRef = React.useRef(null);
+    const busyRef = React.useRef(false);
+    const dirtyRef = React.useRef(false);
+    React.useEffect(() => {
+        if (!enabled || !slides || slides.length === 0) return undefined;
+        dirtyRef.current = true;
+        setState(s => (s.status === 'saving' ? s : { ...s, status: 'pending' }));
+        clearTimeout(timerRef.current);
+        timerRef.current = setTimeout(async () => {
+            if (busyRef.current) return;
+            busyRef.current = true;
+            setState(s => ({ ...s, status: 'saving' }));
+            try {
+                await saveProjectSnapshot(slides);
+                dirtyRef.current = false;
+                setState({ status: 'saved', savedAt: Date.now() });
+            } catch (e) {
+                setState(s => ({ ...s, status: 'error' }));
+            } finally {
+                busyRef.current = false;
+            }
+        }, 2500);
+        return () => clearTimeout(timerRef.current);
+    }, [slides, enabled]);
+    return { ...state, dirtyRef };
+};
+
+// U-03. Попередження браузера при закритті вкладки з незбереженими змінами
+const useBeforeUnloadGuard = (shouldWarn) => {
+    React.useEffect(() => {
+        const h = (e) => {
+            if (shouldWarn()) { e.preventDefault(); e.returnValue = ''; }
+        };
+        window.addEventListener('beforeunload', h);
+        return () => window.removeEventListener('beforeunload', h);
+    }, [shouldWarn]);
+};
+
+// U-04. Компактний індикатор стану автозбереження для топбара
+const AutosaveIndicator = ({ status, savedAt }) => {
+    if (status === 'idle') return null;
+    const time = savedAt ? new Date(savedAt).toLocaleTimeString('uk-UA', { hour: '2-digit', minute: '2-digit' }) : '';
+    const LABEL = {
+        pending: '● Незбережені зміни…',
+        saving: 'Зберігаємо…',
+        saved: `Збережено · ${time}`,
+        error: '⚠ Не вдалося зберегти'
+    };
+    const COLOR = { pending: '#f59e0b', saving: '#64748b', saved: '#059669', error: '#dc2626' };
+    return (
+        <span className="text-[10px] font-semibold whitespace-nowrap" style={{ color: COLOR[status] }} title="Проєкт автоматично зберігається у сховищі браузера">
+            {LABEL[status]}
+        </span>
+    );
+};
+
+/* ── U-02. Банер відновлення попередньої сесії ── */
+const RestoreBanner = ({ savedAt, slidesCount, onRestore, onDismiss }) => (
+    <div className="max-w-xl mx-auto mb-4 bg-violet-50 border border-violet-200 rounded-xl px-4 py-3 flex items-center gap-3">
+        <span className="text-lg" aria-hidden="true">🕘</span>
+        <div className="flex-1 text-left">
+            <div className="text-xs font-bold text-slate-700">Знайдено незавершений проєкт</div>
+            <div className="text-[11px] text-slate-500">
+                {slidesCount} слайд(ів) · збережено {new Date(savedAt).toLocaleString('uk-UA')}
+            </div>
+        </div>
+        <button onClick={onRestore} className="px-3 py-1.5 rounded-lg text-xs font-bold text-white" style={{ backgroundColor: TOKENS.primary }}>
+            Відновити
+        </button>
+        <button onClick={onDismiss} className="px-2 py-1.5 rounded-lg text-xs font-semibold text-slate-500 hover:bg-violet-100" title="Видалити збережену сесію">
+            Відхилити
+        </button>
+    </div>
+);
+
+/* ── U-19. Оверлей прогресу імпорту PPTX ── */
+const ImportProgressOverlay = ({ progress }) => {
+    if (!progress) return null;
+    const pct = progress.total > 0 ? Math.round((progress.current / progress.total) * 100) : 0;
+    return (
+        <div className="fixed inset-0 z-[95] bg-white/85 backdrop-blur-sm flex flex-col items-center justify-center gap-3" role="status" aria-live="polite">
+            <div className="w-10 h-10 border-4 border-violet-200 rounded-full animate-spin" style={{ borderTopColor: TOKENS.primary }} />
+            <div className="text-sm font-bold text-slate-700">{progress.stage}</div>
+            {progress.total > 0 && (
+                <div className="w-64">
+                    <div className="h-2 bg-slate-200 rounded-full overflow-hidden">
+                        <div className="h-full rounded-full transition-all" style={{ width: `${pct}%`, backgroundColor: TOKENS.primary }} />
+                    </div>
+                    <div className="text-[11px] text-slate-500 text-center mt-1">{progress.current} з {progress.total}</div>
+                </div>
+            )}
+        </div>
+    );
+};
+
+/* ── U-70/U-71. Чекліст готовності до експорту (шапка меню «Завантажити») ── */
+const formatDuration = (sec) => {
+    const m = Math.floor(sec / 60);
+    const s = Math.round(sec % 60);
+    return `${m}:${String(s).padStart(2, '0')}`;
+};
+
+const ExportReadiness = ({ slidesTotal, unvoiced, durationSec, isGenerating, onGenerateMissing }) => (
+    <div className="px-3 py-2 bg-slate-50 border-b border-slate-100 space-y-1">
+        <div className="flex items-center justify-between text-[11px] font-semibold text-slate-600">
+            <span>✅ Слайдів: {slidesTotal}</span>
+            <span title="Орієнтовна тривалість готового відео">⏱ {formatDuration(durationSec)}</span>
+        </div>
+        {unvoiced > 0 ? (
+            <div className="flex items-center justify-between gap-2">
+                <span className="text-[11px] font-semibold text-amber-600">⚠ Без озвучки: {unvoiced}</span>
+                <button
+                    onClick={onGenerateMissing}
+                    disabled={isGenerating}
+                    className="text-[11px] font-bold underline disabled:opacity-50"
+                    style={{ color: TOKENS.primary }}
+                >
+                    {isGenerating ? 'Генеруємо…' : 'Згенерувати'}
+                </button>
+            </div>
+        ) : (
+            <div className="text-[11px] font-semibold text-emerald-600">✅ Усі слайди з текстом озвучено</div>
+        )}
+    </div>
+);
+
+/* ── U-17. Валідація файлу ДО парсингу: зрозуміла відповідь замість помилки
+ *    парсера («Failed to read zip») ── */
+const validatePptxFile = async (file) => {
+    if (!file) return { ok: false, reason: 'Файл не обрано.' };
+    if (/\.pps[xm]?$|\.pptm$/i.test(file.name)) return { ok: true }; // родинні формати — теж ZIP/OOXML
+    if (!/\.pptx$/i.test(file.name)) {
+        if (/\.ppt$/i.test(file.name)) {
+            return { ok: false, reason: 'Це старий формат .ppt. Відкрийте файл у PowerPoint і збережіть як .pptx.' };
+        }
+        if (/\.(odp|key)$/i.test(file.name)) {
+            return { ok: false, reason: `Формат «.${file.name.split('.').pop()}» не підтримується. Експортуйте презентацію у .pptx.` };
+        }
+        return { ok: false, reason: `«${file.name}» не схожий на презентацію PowerPoint (.pptx).` };
+    }
+    try {
+        const head = new Uint8Array(await file.slice(0, 4).arrayBuffer());
+        if (!(head[0] === 0x50 && head[1] === 0x4B)) {
+            return { ok: false, reason: 'Файл пошкоджено або це не справжній .pptx (немає ZIP-сигнатури).' };
+        }
+    } catch (e) { /* не вдалося прочитати заголовок — нехай спробує парсер */ }
+    return { ok: true };
+};
+
+/* ============================================================================
+ * U-102. Словник вимови TTS: пари «термін → як читати». Підставляється в текст
+ * ЛИШЕ перед генерацією озвучки (на слайді видно оригінал). Зберігається у
+ * localStorage — терміни користувача спільні для всіх його проєктів.
+ * ========================================================================== */
+const PRON_DICT_KEY = 'atmo-pronunciation-dict';
+
+const loadPronunciationDict = () => {
+    try {
+        const raw = JSON.parse(localStorage.getItem(PRON_DICT_KEY) || '[]');
+        return Array.isArray(raw) ? raw : [];
+    } catch (e) { return []; }
+};
+
+const savePronunciationDict = (dict) => {
+    try { localStorage.setItem(PRON_DICT_KEY, JSON.stringify(dict || [])); } catch (e) { /* ignore */ }
+};
+
+// Заміна цілих слів без урахування регістру (без lookbehind — сумісно зі старими Safari)
+const applyPronunciationDict = (text, dict) => {
+    let out = String(text || '');
+    for (const pair of (dict || [])) {
+        const from = (pair.from || '').trim();
+        const to = (pair.to || '').trim();
+        if (!from || !to) continue;
+        const esc = from.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        out = out.replace(
+            new RegExp(`(^|[^\\p{L}\\p{N}])${esc}(?=$|[^\\p{L}\\p{N}])`, 'giu'),
+            (m, lead) => lead + to
+        );
+    }
+    return out;
+};
+
+const PronunciationDictModal = ({ open, onClose, dict, onChange }) => {
+    React.useEffect(() => {
+        if (!open) return;
+        const h = (e) => { if (e.key === 'Escape') onClose(); };
+        window.addEventListener('keydown', h);
+        return () => window.removeEventListener('keydown', h);
+    }, [open, onClose]);
+    if (!open) return null;
+    const rows = dict && dict.length ? dict : [];
+    const setRow = (i, patch) => onChange(rows.map((r, j) => (j === i ? { ...r, ...patch } : r)));
+    const delRow = (i) => onChange(rows.filter((_, j) => j !== i));
+    const addRow = () => onChange([...rows, { from: '', to: '' }]);
+    return (
+        <div className="fixed inset-0 z-[90] flex items-center justify-center" role="dialog" aria-modal="true" aria-label="Словник вимови">
+            <div className="absolute inset-0 bg-black/40" onClick={onClose} />
+            <div className="relative bg-white rounded-2xl shadow-2xl w-[460px] max-w-[94vw] max-h-[82vh] overflow-y-auto p-5">
+                <div className="flex items-center justify-between mb-1">
+                    <h2 className="text-sm font-bold text-slate-800">Словник вимови</h2>
+                    <button onClick={onClose} aria-label="Закрити" className="text-slate-400 hover:text-slate-600 p-1">✕</button>
+                </div>
+                <p className="text-[11px] text-slate-500 mb-3 leading-relaxed">
+                    Диктор читатиме терміни так, як ви запишете їх у правій колонці (на слайдах текст не змінюється).
+                    Наголос можна підказати подвоєнням наголошеної голосної або дефісами:
+                    «Python → пАйтон», «кафедра → кАфедра», «ArcGIS → арк-джі-ай-ес».
+                </p>
+                <div className="space-y-2">
+                    <div className="grid grid-cols-[1fr_1fr_28px] gap-2 text-[10px] font-bold text-slate-400 uppercase">
+                        <span>Термін у тексті</span><span>Як читати</span><span />
+                    </div>
+                    {rows.map((r, i) => (
+                        <div key={i} className="grid grid-cols-[1fr_1fr_28px] gap-2">
+                            <input
+                                value={r.from}
+                                onChange={(e) => setRow(i, { from: e.target.value })}
+                                placeholder="OSINT"
+                                className="px-2 py-1.5 text-xs border border-slate-200 rounded-lg outline-none focus:border-violet-400 bg-white"
+                            />
+                            <input
+                                value={r.to}
+                                onChange={(e) => setRow(i, { to: e.target.value })}
+                                placeholder="о-сІнт"
+                                className="px-2 py-1.5 text-xs border border-slate-200 rounded-lg outline-none focus:border-violet-400 bg-white"
+                            />
+                            <button onClick={() => delRow(i)} aria-label="Видалити пару" className="text-slate-300 hover:text-red-500 text-sm">✕</button>
+                        </div>
+                    ))}
+                    {rows.length === 0 && (
+                        <div className="text-[11px] text-slate-400 italic py-2 text-center">Поки що порожньо — додайте перший термін</div>
+                    )}
+                </div>
+                <button
+                    onClick={addRow}
+                    className="mt-3 px-3 py-1.5 rounded-lg text-xs font-bold text-white"
+                    style={{ backgroundColor: TOKENS.primary }}
+                >+ Додати термін</button>
+            </div>
+        </div>
+    );
+};
+
+/* ============================================================================
+ * U-110. Error boundary: збій рендера показує картку відновлення, а не
+ * «білий екран». key={selectedSlideId} у місці використання гарантує, що
+ * перемикання слайда автоматично скидає помилку.
+ * ========================================================================== */
+class UIErrorBoundary extends React.Component {
+    constructor(props) {
+        super(props);
+        this.state = { error: null };
+    }
+    static getDerivedStateFromError(error) { return { error }; }
+    componentDidCatch(error, info) {
+        if (this.props.onError) this.props.onError(error, info);
+    }
+    render() {
+        if (this.state.error) {
+            return (
+                <div className="flex-1 flex items-center justify-center p-8 bg-slate-50">
+                    <div className="bg-white border border-red-200 rounded-2xl shadow-lg p-6 max-w-md text-center space-y-3">
+                        <div className="text-2xl" aria-hidden="true">⚠️</div>
+                        <div className="text-sm font-bold text-slate-800">Не вдалося відобразити {this.props.label || 'вміст'}</div>
+                        <div className="text-[11px] text-slate-500 break-words">{String(this.state.error && this.state.error.message || this.state.error)}</div>
+                        <div className="flex items-center justify-center gap-2">
+                            <button
+                                onClick={() => this.setState({ error: null })}
+                                className="px-4 py-2 rounded-lg text-xs font-bold text-white"
+                                style={{ backgroundColor: TOKENS.primary }}
+                            >Спробувати ще раз</button>
+                            {this.props.onUndo && (
+                                <button
+                                    onClick={() => { this.props.onUndo(); this.setState({ error: null }); }}
+                                    className="px-4 py-2 rounded-lg text-xs font-bold text-slate-600 bg-slate-100 hover:bg-slate-200"
+                                >Скасувати останню дію</button>
+                            )}
+                        </div>
+                        <div className="text-[10px] text-slate-400">Проєкт не втрачено: він автоматично збережений у сховищі браузера.</div>
+                    </div>
+                </div>
+            );
+        }
+        return this.props.children;
+    }
+}
+
+/* ── U-21. Людські пояснення помилок API озвучки ── */
+const humanizeTtsError = (message) => {
+    const m = String(message || '');
+    if (m.includes('429')) return 'Сервіс озвучки перевантажено (забагато запитів). Зачекайте хвилину і спробуйте ще раз.';
+    if (m.includes('403') || m.includes('401')) return 'Немає доступу до сервісу озвучки. Перевірте ключ API.';
+    if (m.includes('Failed to fetch') || m.includes('NetworkError')) return 'Немає з\'єднання з інтернетом. Перевірте мережу і повторіть.';
+    if (m.includes('Не отримано аудіо')) return 'Сервіс не повернув аудіо. Спробуйте коротший текст або повторіть пізніше.';
+    return m;
+};
+
 /* ============================================================================
  * ІКОНКИ — inline SVG (замість lucide-react CDN, що не резолвиться у цьому
  * рантаймі: babel-standalone + React UMD не надає named-export'ів lucide-react).
@@ -76,6 +609,7 @@ const H5P_TYPES = [
     ['fill', 'Заповни пропуск', '▭'],
     ['summary', 'Обери правильне', '✓'],
     ['hotspot', 'Гаряча точка', '◉'],
+    ['fact', 'Цікавий факт (фото+текст)', '★'],
     ['info', 'Інфо-блок', 'ℹ'],
     ['accordion', 'Акордеон', '≡'],
     ['flashcard', 'Картка (фліп)', '⇄'],
@@ -93,8 +627,20 @@ const InteractiveWidget = ({ obj, scale, interactive }) => {
     const pe = interactive ? 'auto' : 'none';
     const stop = (e) => { if (interactive) e.stopPropagation(); };
     const card = { borderColor: accent, pointerEvents: pe, fontSize: fs };
+    const [dotOpen, setDotOpen] = React.useState(false);
 
+    const renderBody = () => {
     switch (obj.iType) {
+        case 'fact': // Цікавий факт: картинка + заголовок + текст
+            return (
+                <div className="w-full h-full bg-white rounded-xl shadow-xl border-2 overflow-hidden flex flex-col" style={card} onMouseDown={stop}>
+                    {obj.image && <img src={obj.image} alt="" className="w-full object-cover" style={{ maxHeight: '55%' }} draggable={false} />}
+                    <div className="p-2 overflow-y-auto">
+                        <div className="font-bold" style={{ color: accent }}>★ {obj.title || 'Цікавий факт'}</div>
+                        <div className="text-slate-700 mt-1 whitespace-pre-wrap">{obj.content || ''}</div>
+                    </div>
+                </div>
+            );
         case 'hotspot':
             return (
                 <div className="w-full h-full relative" style={{ pointerEvents: pe }}>
@@ -192,6 +738,43 @@ const InteractiveWidget = ({ obj, scale, interactive }) => {
                 </button>
             );
     }
+    };
+
+    // ── H5P-стиль (Interactive Video): у режимі перегляду КОЖЕН інтерактив —
+    // пульсуюча точка поверх відео/слайда; клік розкриває вміст (тест, факт,
+    // картку...), ✕ згортає назад у точку. Гарячі точки/кнопки — і так точки.
+    if (interactive && obj.iType !== 'hotspot' && obj.iType !== 'link') {
+        if (!dotOpen) {
+            const icon = (H5P_TYPES.find(t => t[0] === obj.iType) || [null, null, '☑'])[2];
+            return (
+                <div className="w-full h-full relative" style={{ pointerEvents: 'auto' }}>
+                    <button
+                        onClick={(e) => { e.stopPropagation(); setDotOpen(true); }}
+                        aria-label="Відкрити інтерактив"
+                        title={(H5P_TYPES.find(t => t[0] === obj.iType) || [null, 'Інтерактив'])[1]}
+                        className="absolute rounded-full flex items-center justify-center text-white font-extrabold shadow-lg"
+                        style={{
+                            left: '50%', top: '50%', transform: 'translate(-50%, -50%)',
+                            width: Math.max(34, 44 * scale), height: Math.max(34, 44 * scale),
+                            background: accent, fontSize: Math.max(15, 20 * scale),
+                            animation: 'pulse 1.6s infinite', border: '3px solid rgba(255,255,255,0.85)'
+                        }}
+                    >{icon}</button>
+                </div>
+            );
+        }
+        return (
+            <div className="w-full h-full relative" style={{ pointerEvents: 'auto' }} onMouseDown={stop}>
+                {renderBody()}
+                <button
+                    onClick={(e) => { e.stopPropagation(); setDotOpen(false); }}
+                    aria-label="Згорнути інтерактив у точку"
+                    className="absolute -top-2 -right-2 w-6 h-6 rounded-full bg-slate-800 hover:bg-slate-900 text-white text-xs font-bold shadow z-20"
+                >✕</button>
+            </div>
+        );
+    }
+    return renderBody();
 };
 
 /* ============================================================================
@@ -258,6 +841,25 @@ const downloadChangeLog = (format = 'txt') => {
  * ========================================================================== */
 
 let currentCtx = null;
+
+// U-105: завжди живий AudioContext. Браузер може «приспати» (suspended) або
+// закрити контекст — звук зникає до перезавантаження сторінки. Тут він
+// автоматично створюється заново/пробуджується перед кожним використанням.
+const getLiveAudioCtx = () => {
+    if (!currentCtx || currentCtx.state === 'closed') {
+        currentCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    if (currentCtx.state === 'suspended') {
+        try { currentCtx.resume(); } catch (e) { /* ignore */ }
+    }
+    return currentCtx;
+};
+// Примусовий перезапуск звукового рушія (кнопка «Перезапустити звук»)
+const restartAudioEngine = () => {
+    try { if (currentCtx && currentCtx.state !== 'closed') currentCtx.close(); } catch (e) { /* ignore */ }
+    currentCtx = null;
+    return getLiveAudioCtx();
+};
 
 // Внутрішня система координат слайду (повне HD 16:9)
 const CANVAS_W = 1280;
@@ -339,7 +941,36 @@ const IMAGE_MIME_BY_EXT = {
     ico: 'image/x-icon', cur: 'image/x-icon',
     tif: 'image/tiff', tiff: 'image/tiff',
     avif: 'image/avif',
-    heic: 'image/heic', heif: 'image/heif'
+    heic: 'image/heic', heif: 'image/heif',
+    jxl: 'image/jxl',
+    jxr: 'image/vnd.ms-photo', wdp: 'image/vnd.ms-photo', hdp: 'image/vnd.ms-photo',
+    svgz: 'image/svg+xml' // gzip-стиснений SVG — розпаковується перед показом
+};
+
+// Формати, які рендеряться не в усіх браузерах: перекодовуємо у PNG через
+// власний декодер браузера (Image -> canvas). Після конвертації зображення
+// гарантовано працює всюди: у редакторі, canvas-експорті, .atmo та MP4-циклі.
+const TRANSCODE_TO_PNG = new Set(['image/tiff', 'image/heic', 'image/heif', 'image/x-icon', 'image/vnd.ms-photo', 'image/jxl']);
+const transcodeToPng = (src) => new Promise((resolve) => {
+    if (typeof document === 'undefined') return resolve(null);
+    const img = new Image();
+    img.onload = () => {
+        try {
+            const cv = document.createElement('canvas');
+            cv.width = img.naturalWidth || img.width;
+            cv.height = img.naturalHeight || img.height;
+            if (!cv.width || !cv.height) return resolve(null);
+            cv.getContext('2d').drawImage(img, 0, 0);
+            resolve(cv.toDataURL('image/png'));
+        } catch (e) { resolve(null); }
+    };
+    img.onerror = () => resolve(null);
+    img.src = src;
+});
+// Розпакування gzip (svgz) вбудованим DecompressionStream
+const gunzipToText = async (bytes) => {
+    const stream = new Response(bytes).body.pipeThrough(new DecompressionStream('gzip'));
+    return new TextDecoder().decode(await new Response(stream).arrayBuffer());
 };
 // Визначення формату за магічними байтами — для файлів без/з хибним розширенням
 const sniffImageMime = (b) => {
@@ -351,6 +982,8 @@ const sniffImageMime = (b) => {
     if (b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46
         && b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50) return 'image/webp';
     if (b[0] === 0x00 && b[1] === 0x00 && b[2] === 0x01 && b[3] === 0x00) return 'image/x-icon';
+    if (b[0] === 0x1F && b[1] === 0x8B) return 'application/gzip'; // svgz
+    if (b[0] === 0xFF && b[1] === 0x0A) return 'image/jxl';
     if ((b[0] === 0x49 && b[1] === 0x49 && b[2] === 0x2A) || (b[0] === 0x4D && b[1] === 0x4D && b[3] === 0x2A)) return 'image/tiff';
     if (b[4] === 0x66 && b[5] === 0x74 && b[6] === 0x79 && b[7] === 0x70) { // ISO BMFF "ftyp" -> AVIF/HEIC
         const brand = String.fromCharCode(b[8], b[9], b[10], b[11]);
@@ -367,7 +1000,10 @@ const sniffImageMime = (b) => {
 const VIDEO_MIME_BY_EXT = {
     mp4: 'video/mp4', m4v: 'video/mp4', mov: 'video/quicktime', webm: 'video/webm',
     ogv: 'video/ogg', ogg: 'video/ogg', mpeg: 'video/mpeg', mpg: 'video/mpeg',
-    avi: 'video/x-msvideo', wmv: 'video/x-ms-wmv', mkv: 'video/x-matroska'
+    avi: 'video/x-msvideo', wmv: 'video/x-ms-wmv', mkv: 'video/x-matroska',
+    // Аудіо на слайдах (a:audioFile): без правильного mime Safari відмовлявся грати
+    mp3: 'audio/mpeg', wav: 'audio/wav', m4a: 'audio/mp4', aac: 'audio/aac',
+    oga: 'audio/ogg', flac: 'audio/flac', wma: 'audio/x-ms-wma', opus: 'audio/ogg'
 };
 
 // Маркери вшитого проєкту у експортованому відео (зворотна конвертація MP4 → редактор)
@@ -380,6 +1016,75 @@ const indexOfBytes = (hay, needle, from = 0) => {
         return i;
     }
     return -1;
+};
+
+// ── Серіалізація проєкту для вшивання в MP4 (зворотна конвертація) ──
+// blob:-URL відео/аудіо живуть лише до перезавантаження сторінки, тому у знімок
+// вони вшиваються як data:-URL (base64). Без цього відкритий назад MP4 містив
+// мертві посилання: відео зникали і з редактора, і з повторного експорту.
+const serializeSlidesForEmbed = async (slides) => {
+    const cache = new Map(); // blob:-URL -> data:-URL (одне відео може бути на кількох слайдах)
+    const out = [];
+    for (const s of slides) {
+        const objects = [];
+        for (const o of (s.objects || [])) {
+            if ((o.type === 'video' || o.type === 'audio') && o.src && o.src.startsWith('blob:')) {
+                let dataUrl = cache.get(o.src);
+                if (dataUrl === undefined) {
+                    try {
+                        const blob = await fetch(o.src).then(r => r.blob());
+                        dataUrl = await new Promise((res, rej) => {
+                            const fr = new FileReader();
+                            fr.onload = () => res(fr.result);
+                            fr.onerror = () => rej(fr.error);
+                            fr.readAsDataURL(blob);
+                        });
+                    } catch (e) { dataUrl = null; }
+                    cache.set(o.src, dataUrl);
+                }
+                objects.push({ ...o, src: dataUrl });
+            } else {
+                objects.push(o);
+            }
+        }
+        out.push({ ...s, objects, isGenerating: false });
+    }
+    return out;
+};
+
+// Оживлення знімка після зворотної конвертації: data:-URL медіа -> свіжі blob:-URL
+// (ефективніше для <video> і canvas), мертві blob: зі старих експортів -> null.
+// Повертає { slides, deadMedia } — кількість відео, які відновити неможливо.
+const reviveEmbeddedSlides = (snapshotSlides) => {
+    let deadMedia = 0;
+    const cache = new Map(); // data:-URL -> blob:-URL
+    const slides = snapshotSlides.map(s => ({
+        ...s,
+        isGenerating: false,
+        objects: (s.objects || []).map(o => {
+            if ((o.type === 'video' || o.type === 'audio') && typeof o.src === 'string') {
+                if (o.src.startsWith('data:')) {
+                    let url = cache.get(o.src);
+                    if (url === undefined) {
+                        try {
+                            const comma = o.src.indexOf(',');
+                            const mime = (o.src.slice(5, comma).split(';')[0]) || 'video/mp4';
+                            const bin = atob(o.src.slice(comma + 1));
+                            const bytes = new Uint8Array(bin.length);
+                            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+                            url = URL.createObjectURL(new Blob([bytes], { type: mime }));
+                        } catch (e) { url = null; }
+                        cache.set(o.src, url);
+                    }
+                    if (!url) deadMedia++;
+                    return { ...o, src: url };
+                }
+                if (o.src.startsWith('blob:')) { deadMedia++; return { ...o, src: null }; } // старий експорт
+            }
+            return o;
+        })
+    }));
+    return { slides, deadMedia };
 };
 
 // Кольори теми Office за замовчуванням — перезаписуються темою конкретної презентації
@@ -907,7 +1612,20 @@ const EASING = {
 
 // Стан об'єкта в момент часу t (сек від початку слайду):
 // видимість, прозорість, зсув, масштаб (X/Y), оберт, clip-маска появи
-const getObjectRenderState = (obj, time) => {
+// U-109: анімації зникнення (exit) — obj.exitAnimation = { type, at, duration }.
+// 'at' — секунда від початку слайда, коли об'єкт починає зникати.
+const EXIT_ANIMATIONS = {
+    none: 'Без зникнення',
+    fadeOut: 'Розчинення',
+    flyOutLeft: 'Відліт ліворуч',
+    flyOutRight: 'Відліт праворуч',
+    flyOutTop: 'Відліт угору',
+    flyOutBottom: 'Відліт униз',
+    zoomOut: 'Зменшення',
+    shrink: 'Стиснення'
+};
+
+const getEntranceState = (obj, time) => {
     const base = { visible: true, alpha: 1, dx: 0, dy: 0, scale: 1, scaleX: null, scaleY: null, rot: 0, clip: null };
     const anim = obj.animation || { type: 'none', delay: 0, duration: 0.5 };
     if (!anim.type || anim.type === 'none') return base;
@@ -947,6 +1665,30 @@ const getObjectRenderState = (obj, time) => {
             return { ...base, alpha: Math.min(p * 2, 1), scale: Math.max(b, 0.01) };
         }
         default: return base;
+    }
+};
+
+// Повний стан об'єкта: поява (entrance) + зникнення (exit, U-109).
+// Exit накладається поверх стану появи, тож обидві анімації сумісні.
+const getObjectRenderState = (obj, time) => {
+    const st = getEntranceState(obj, time);
+    const exit = obj.exitAnimation;
+    if (!exit || !exit.type || exit.type === 'none' || exit.at == null) return st;
+    const xStart = Math.max(exit.at, 0);
+    const xDur = Math.max(exit.duration || 0.5, 0.05);
+    if (time < xStart) return st;
+    if (time >= xStart + xDur) return { ...st, visible: false, alpha: 0 };
+    const q = Math.min((time - xStart) / xDur, 1);
+    const e = EASING.easeOutCubic(q);
+    switch (exit.type) {
+        case 'fadeOut': return { ...st, alpha: st.alpha * (1 - e) };
+        case 'flyOutLeft': return { ...st, dx: st.dx - e * (obj.x + obj.w + 60) };
+        case 'flyOutRight': return { ...st, dx: st.dx + e * (CANVAS_W - obj.x + 60) };
+        case 'flyOutTop': return { ...st, dy: st.dy - e * (obj.y + obj.h + 60) };
+        case 'flyOutBottom': return { ...st, dy: st.dy + e * (CANVAS_H - obj.y + 60) };
+        case 'zoomOut': return { ...st, alpha: st.alpha * (1 - q), scale: st.scale * (1 - 0.6 * e) };
+        case 'shrink': return { ...st, scale: Math.max(st.scale * (1 - e), 0.01), alpha: st.alpha * (1 - q * 0.5) };
+        default: return st;
     }
 };
 
@@ -992,6 +1734,41 @@ const getRenderRuns = (line) => {
     else runs = [];
     if (line.bullet) runs = [{ ...(runs[0] || baseStyle), underline: false, strike: false, math: false, mathml: null, text: line.bullet }, ...runs];
     return runs;
+};
+
+// U-62: хвиля озвучки слайда на таймлайні — видно паузи, межі речень і
+// «порожні хвости». Малюється з 16-біт PCM (audioBase64) один раз на зміну аудіо.
+const WaveformCanvas = ({ base64 }) => {
+    const ref = React.useRef(null);
+    React.useEffect(() => {
+        const cv = ref.current;
+        if (!cv || !base64) return;
+        try {
+            const bin = atob(base64);
+            const n = Math.floor(bin.length / 2);
+            const W = cv.width = Math.max(cv.offsetWidth, 100);
+            const H = cv.height = Math.max(cv.offsetHeight, 24);
+            const g = cv.getContext('2d');
+            g.clearRect(0, 0, W, H);
+            g.fillStyle = 'rgba(124, 58, 237, 0.35)';
+            const step = Math.max(1, Math.floor(n / W));
+            const probe = Math.max(1, Math.floor(step / 32)); // до 32 вимірів на піксель — швидко навіть для хвилинних треків
+            for (let x = 0; x < W; x++) {
+                let peak = 0;
+                const start = x * step;
+                for (let i = start; i < Math.min(start + step, n); i += probe) {
+                    const lo = bin.charCodeAt(2 * i), hi = bin.charCodeAt(2 * i + 1);
+                    let v = (hi << 8) | lo;
+                    if (v >= 0x8000) v -= 0x10000;
+                    const a = Math.abs(v) / 32768;
+                    if (a > peak) peak = a;
+                }
+                const h = Math.max(1, peak * (H - 2));
+                g.fillRect(x, (H - h) / 2, 1, h);
+            }
+        } catch (e) { /* пошкоджене аудіо — просто без хвилі */ }
+    }, [base64]);
+    return <canvas ref={ref} className="absolute inset-0 w-full h-full pointer-events-none" aria-hidden="true" />;
 };
 
 const PPT_FALLBACK_FONTS = '"Calibri", "Arial", "Segoe UI", "Helvetica Neue", "Segoe UI Emoji", "Segoe UI Symbol", "Cambria Math", "STIX Two Math", "Noto Sans Math", "Apple Color Emoji", "Noto Color Emoji", sans-serif';
@@ -1205,7 +1982,11 @@ const TTS_RATES = { slow: 'at a slow, measured pace', normal: '', fast: 'at a br
 const TTS_STYLES = {
     neutral: '', cheerful: 'in a warm, cheerful tone', serious: 'in a serious, formal tone',
     calm: 'in a calm, soothing tone', dramatic: 'in an expressive, dramatic tone',
-    storytelling: 'in an engaging storytelling tone'
+    storytelling: 'in an engaging storytelling tone',
+    // U-103: «живі» тони — відповідь на фідбек «голос звучить строго і роботизовано»
+    energetic: 'in an upbeat, energetic, enthusiastic tone with lively intonation',
+    friendly: 'in a friendly, conversational tone, as if explaining to a good friend',
+    teacher: 'in a warm, encouraging teacher\'s tone, clearly emphasising key terms'
 };
 const buildStyleDirection = (rate, style) => [TTS_RATES[rate] || '', TTS_STYLES[style] || ''].filter(Boolean).join(', ');
 
@@ -1608,7 +2389,9 @@ const extractTextLines = (txBody, ptToPx, defaults = {}) => {
 
 // Головна функція парсингу: повертає нормалізований масив слайдів зі списком об'єктів.
 // Стійкість: помилка окремого слайду чи фігури не зриває імпорт усієї презентації.
-const extractPptxData = async (file) => {
+// onProgress({ stage, current, total }) — живий прогрес для UI (U-19); між слайдами
+// цикл поступається головному потоку (U-90), щоб інтерфейс не «замерзав».
+const extractPptxData = async (file, onProgress) => {
     const JSZip = await loadJSZip();
     const zip = await JSZip.loadAsync(file);
     const parser = new DOMParser();
@@ -1653,8 +2436,24 @@ const extractPptxData = async (file) => {
         if (!mime) {
             try { mime = sniffImageMime(await imgFile.async('uint8array')); } catch (e) { /* ignore */ }
         }
+        // SVGZ (gzip-стиснений SVG): розпаковуємо у звичайний SVG dataURL
+        if (ext === 'svgz' || mime === 'application/gzip') {
+            try {
+                const txt = await gunzipToText(await imgFile.async('uint8array'));
+                if (txt.includes('<svg')) return 'data:image/svg+xml;base64,' + btoa(unescape(encodeURIComponent(txt)));
+            } catch (e) { /* впадемо у звичайну гілку нижче */ }
+            if (mime === 'application/gzip') return null;
+        }
         if (!mime) return null; // векторні EMF/WMF браузер не декодує — буде плейсхолдер
-        return `data:${mime};base64,${await imgFile.async('base64')}`;
+        const dataUrl = `data:${mime};base64,${await imgFile.async('base64')}`;
+        // TIFF/HEIC/ICO/JXR/JXL: конвертуємо у PNG, якщо браузер вміє їх декодувати
+        // (напр. Safari декодує TIFF/HEIC) — результат рендериться вже всюди.
+        // Якщо декодер не впорався — віддаємо оригінал (краще спробувати, ніж втратити).
+        if (TRANSCODE_TO_PNG.has(mime)) {
+            const png = await transcodeToPng(dataUrl);
+            if (png) return png;
+        }
+        return dataUrl;
     };
 
     // Витягує відеофайл за rId (a:videoFile) -> blob URL (або зовнішній http-URL)
@@ -1681,6 +2480,7 @@ const extractPptxData = async (file) => {
     const presDoc = await parseXml('ppt/presentation.xml');
     if (!presDoc) throw new Error("У файлі не знайдено ppt/presentation.xml");
     const sldIds = presDoc.querySelectorAll('sldIdLst sldId');
+    if (onProgress) onProgress({ stage: 'Читаємо тему, шрифти та макети…', current: 0, total: sldIds.length });
 
     const sldSzEl = presDoc.querySelector('sldSz, p\\:sldSz');
     const slideWidthEmu = sldSzEl ? parseInt(sldSzEl.getAttribute('cx'), 10) : 12192000;
@@ -1943,11 +2743,17 @@ const extractPptxData = async (file) => {
 
                 // --- mc:AlternateContent: беремо Fallback (інакше перший Choice) і парсимо його ---
                 // Так не пропускаємо елементи, загорнуті в AlternateContent (SmartArt, нові фігури тощо).
-                // Виняток — формули (Requires="a14"): справжній OMML живе у Choice,
-                // а Fallback містить лише растрову картинку рівняння.
+                // Винятки, де справжній вміст живе у Choice:
+                //  - формули (Requires="a14") — Fallback містить лише картинку рівняння;
+                //  - ВІДЕО/АУДІО (Requires="p14") — сучасний PowerPoint загортає медіа
+                //    саме так, і Fallback — це статична картинка-постер. Без цього
+                //    відео слайда імпортувалось як нерухоме зображення.
                 if (tag === 'mc:AlternateContent' || node.localName === 'AlternateContent') {
                     const acChildren = Array.from(node.children);
+                    const hasMedia = (el) => Array.from(el.getElementsByTagName('*'))
+                        .some(e => e.localName === 'videoFile' || e.localName === 'audioFile');
                     const pick = acChildren.find(c => c.localName === 'Choice' && findOMaths(c).length)
+                        || acChildren.find(c => c.localName === 'Choice' && hasMedia(c))
                         || acChildren.find(c => c.localName === 'Fallback')
                         || acChildren.find(c => c.localName === 'Choice');
                     if (pick) {
@@ -2245,6 +3051,9 @@ const extractPptxData = async (file) => {
     const extractedSlides = [];
 
     for (let i = 0; i < sldIds.length; i++) {
+        if (onProgress) onProgress({ stage: `Розбираємо слайд ${i + 1} з ${sldIds.length}…`, current: i, total: sldIds.length });
+        // Поступаємось головному потоку: прогрес малюється, UI лишається живим (U-90)
+        await new Promise(r => setTimeout(r, 0));
         try {
             const rId = sldIds[i].getAttribute('r:id');
             const rel = presRelsDoc.querySelector(`Relationship[Id="${rId}"]`);
@@ -2368,9 +3177,14 @@ const extractPptxData = async (file) => {
         }
     }
     if (videoSrcsToWarm.size && typeof document !== 'undefined') {
-        Promise.all(Array.from(videoSrcsToWarm).map(src => loadVideo(src))).then(() => {
+        // U-97: прогріваємо послідовно, а не всі одночасно — багато великих відео
+        // паралельно виснажують пам'ять декодера і «кладуть» вкладку
+        (async () => {
+            for (const src of Array.from(videoSrcsToWarm)) {
+                try { await loadVideo(src); } catch (e) { /* ignore */ }
+            }
             logChange('Імпорт', `Відео підготовлено до відтворення: ${videoSrcsToWarm.size}`);
-        }).catch(() => { /* ignore */ });
+        })();
     }
 
     logChange('Імпорт', `Розібрано презентацію: ${extractedSlides.length} слайд(ів)`, {
@@ -2854,6 +3668,30 @@ const drawObject = (ctx, obj, state, time = 0) => {
         return;
     }
 
+    // Бігучий рядок (титри): з'являється за obj.startBeforeEnd секунд до кінця
+    // слайда і рівно за цей час пролітає текст справа наліво (як стрічка новин)
+    if (obj.type === 'ticker') {
+        const slideDur = obj.__slideDur || 0;
+        const startAt = Math.max(0, slideDur - (obj.startBeforeEnd != null ? obj.startBeforeEnd : 5));
+        const runTime = Math.max(slideDur - startAt, 0.5);
+        if (time < startAt || slideDur <= 0) { ctx.restore(); return; }
+        const p = Math.min((time - startAt) / runTime, 1);
+        ctx.fillStyle = obj.fillColor || 'rgba(15, 23, 42, 0.85)';
+        ctx.fillRect(0, 0, obj.w, obj.h);
+        const fs = obj.fontSize || 32;
+        ctx.font = `bold ${fs}px ${PPT_FALLBACK_FONTS}`;
+        ctx.fillStyle = obj.color || '#ffffff';
+        ctx.textBaseline = 'middle';
+        ctx.textAlign = 'left';
+        const txt = obj.text || '';
+        const textW = ctx.measureText(txt).width;
+        // Рух: текст залітає з правого краю і повністю виходить за лівий
+        const x = obj.w - p * (obj.w + textW);
+        ctx.fillText(txt, x, obj.h / 2);
+        ctx.restore();
+        return;
+    }
+
     if (obj.type === 'audio') {
         const cx = obj.w / 2, cy = obj.h / 2;
         ctx.fillStyle = '#f43f5e';
@@ -2911,6 +3749,9 @@ const drawObject = (ctx, obj, state, time = 0) => {
             cardBg(true);
             const shown = String(obj.text || '').replace(/\*[^*]+\*/g, '_____');
             drawTextBlock(ctx, [run(shown, '#1e293b', 18)], obj.w, obj.h, 'ctr', 14, 12, true);
+        } else if (obj.iType === 'fact') {
+            cardBg(true);
+            drawTextBlock(ctx, [run('★ ' + (obj.title || 'Цікавий факт'), accent, 20, true), run(obj.content || '', '#334155', 16)], obj.w, obj.h, 't', 14, 12, true);
         } else if (obj.iType === 'info') {
             cardBg(false);
             ctx.fillStyle = accent; ctx.fillRect(0, 0, 5, obj.h);
@@ -3022,7 +3863,7 @@ const drawSlideFrame = (ctx, slide, time) => {
         ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
     }
     for (const obj of (slide.objects || [])) {
-        drawObject(ctx, obj, getObjectRenderState(obj, time), time);
+        drawObject(ctx, obj.type === 'ticker' ? { ...obj, __slideDur: getSlideDuration(slide) } : obj, getObjectRenderState(obj, time), time);
     }
 };
 
@@ -3266,6 +4107,17 @@ const drawTransitionFrame = (ctx, prevCanvas, nextCanvas, type, progress) => {
 };
 
 // Повна тривалість слайду: аудіо + хвіст, або час завершення останньої анімації
+// Тривалість переходу ДО слайда: власне значення slide.transitionDuration
+// (0.1–5с) або типова тривалість ефекту. Для 'none'/'cut' завжди 0.
+const getTransitionDuration = (slide) => {
+    const def = TRANSITIONS[slide.transition] || TRANSITIONS.none;
+    const base = def.duration || 0;
+    if (base <= 0) return 0;
+    return slide.transitionDuration != null
+        ? Math.max(0.1, Math.min(Number(slide.transitionDuration) || base, 5))
+        : base;
+};
+
 const getSlideDuration = (slide) => {
     const animEnd = (slide.objects || []).reduce((m, o) => {
         const a = o.animation;
@@ -3499,6 +4351,18 @@ function videoReducer(state, action) {
             };
         }
 
+        // U-108: вимкнути всі анімації слайда одним кліком (появу і зникнення)
+        case 'CLEAR_SLIDE_ANIMATIONS': {
+            return mapSlide(action.slideId, s => ({
+                ...s,
+                objects: s.objects.map(o => ({
+                    ...o,
+                    animation: { type: 'none', delay: 0, duration: 0.5 },
+                    exitAnimation: null
+                }))
+            }));
+        }
+
         case 'SYNC_ANIMATIONS_TO_AUDIO': {
             return mapSlide(action.slideId, s => {
                 const dur = s.audioDuration || 0;
@@ -3603,6 +4467,35 @@ export default function VideoEditor() {
     const [assistantError, setAssistantError] = useState(null);
     const [regeneratingSlideId, setRegeneratingSlideId] = useState(null);
     const [animPrompt, setAnimPrompt] = useState('');
+    // Однотипні анімації: рівно 3 обрані типи на ВСІ слайди (обирає користувач,
+    // за замовчуванням програма пропонує спокійну трійку)
+    const [uniformTypes, setUniformTypes] = useState(['fadeIn', 'floatIn', 'zoomIn']);
+    const applyUniformAnimations = () => {
+        if (!slides.length) return;
+        const [tTitle, tMedia, tRest] = uniformTypes;
+        const plan = slides.map(sl => {
+            let firstText = true;
+            let order = 0;
+            return {
+                slideNumber: sl.slideNumber,
+                narration: sl.text,
+                transition: sl.transition,
+                animations: sl.objects.map(o => {
+                    // Розподіл ролей: перший текст (заголовок) -> тип 1,
+                    // зображення/відео -> тип 2, решта -> тип 3; каскад 0.4с
+                    let type = tRest;
+                    if (o.type === 'text' && firstText) { type = tTitle; firstText = false; }
+                    else if (o.type === 'image' || o.type === 'video') type = tMedia;
+                    return { objectId: o.id, type, delay: Math.round(order++ * 0.4 * 10) / 10, duration: 0.8 };
+                })
+            };
+        });
+        dispatchVideo({ type: 'APPLY_AI_PLAN', plan, keepAudio: true });
+        toast('success', `Усі слайди анімовано трьома типами: ${uniformTypes.map(t => ANIMATIONS[t]?.label || t).join(' · ')}`, {
+            action: { label: 'Повернути', onClick: () => dispatchVideo({ type: 'UNDO' }) }
+        });
+        logChange('Анімація', 'Однотипні анімації на всі слайди', { types: uniformTypes });
+    };
     const [isAutoAnimating, setIsAutoAnimating] = useState(false);
     const [bulkTransition, setBulkTransition] = useState('fade');
     const [scrubTime, setScrubTime] = useState(null);
@@ -3632,6 +4525,238 @@ export default function VideoEditor() {
     const [videoDialog, setVideoDialog] = useState(false);
     const [interactiveMode, setInteractiveMode] = useState(false); // режим «гра» для H5P-інтерактивів
     const [exportMenuOpen, setExportMenuOpen] = useState(false);    // меню форматів експорту
+
+    // ── UXKit (Спринт 1): прогрес імпорту, довідка клавіш, автозбереження, відновлення ──
+    const [importProgress, setImportProgress] = useState(null);     // { stage, current, total } | null (U-19)
+    const [shortcutsOpen, setShortcutsOpen] = useState(false);      // модал гарячих клавіш (U-72)
+    const [restoreSnapshot, setRestoreSnapshot] = useState(null);   // збережена сесія для банера (U-02)
+    const autosave = useAutosave(slides);                           // IndexedDB, дебаунс 2.5с (U-01/U-04)
+    const autosaveDirtyRef = autosave.dirtyRef;
+    const shouldWarnBeforeUnload = useCallback(
+        () => autosaveDirtyRef.current === true,
+        [autosaveDirtyRef]
+    );
+    useBeforeUnloadGuard(shouldWarnBeforeUnload);                   // U-03
+    useEffect(() => {                                               // разова перевірка збереженої сесії
+        let alive = true;
+        loadProjectSnapshot().then(snap => { if (alive && snap) setRestoreSnapshot(snap); });
+        return () => { alive = false; };
+    }, []);
+    const restoreSession = () => {
+        if (!restoreSnapshot) return;
+        dispatchVideo({ type: 'SET_SLIDES', slides: restoreSnapshot.slides });
+        setSelectedSlideId(restoreSnapshot.slides[0]?.id || null);
+        setSelectedObjectId(null);
+        setRestoreSnapshot(null);
+        toast('success', `Сесію відновлено: ${restoreSnapshot.slides.length} слайд(ів)`);
+        logChange('Сесія', 'Відновлено автозбережений проєкт', { slides: restoreSnapshot.slides.length });
+    };
+    const dismissRestore = () => {
+        clearProjectSnapshot();
+        setRestoreSnapshot(null);
+    };
+    // U-102: словник вимови TTS (localStorage — терміни спільні для всіх проєктів)
+    const [pronDict, setPronDict] = useState(loadPronunciationDict);
+    const [pronDictOpen, setPronDictOpen] = useState(false);
+    const updatePronDict = (d) => { setPronDict(d); savePronunciationDict(d); };
+    // U-105: watchdog звуку — раз на 5с будимо приспаний браузером AudioContext
+    useEffect(() => {
+        const id = setInterval(() => {
+            if (currentCtx && currentCtx.state === 'suspended') {
+                try { currentCtx.resume(); } catch (e) { /* ignore */ }
+            }
+        }, 5000);
+        return () => clearInterval(id);
+    }, []);
+    // ── UX-батч: перетягування слайдів, рамкове виділення, контекстне меню,
+    //    вирівнювання, зразки голосів, ETA експорту ──
+    const slideDragIdxRef = useRef(null);                            // U-26
+    const [marqueeRect, setMarqueeRect] = useState(null);            // U-38
+    const [ctxMenu, setCtxMenu] = useState(null);                    // U-42 {x,y,objId}
+    const [exportEta, setExportEta] = useState('');                  // U-23
+    const [scenesCollapsed, setScenesCollapsed] = useState(false);   // U-33
+    const [helpOpen, setHelpOpen] = useState(false);                 // U-111
+    const cancelGenerationRef = useRef(false);                       // U-69: зупинка пакетної озвучки
+    const [tourStep, setTourStep] = useState(null);                  // U-14: тур для новачків (null = вимкнено)
+    useEffect(() => { // тур показується один раз — при першому вході в редактор
+        if (slides.length > 0 && !localStorage.getItem('atmo-tour-done')) setTourStep(0);
+    }, [slides.length > 0]); // eslint-disable-line
+
+    // U-13: демо-проєкт — спробувати редактор без власного файлу
+    const startDemoProject = () => {
+        const mkSlide = (num, objects, text, transition) => ({
+            id: crypto.randomUUID(), slideNumber: num, speakerNotes: '', text,
+            background: '#FFFFFF', bgGradient: null, bgImage: null, objects,
+            audioBase64: null, sampleRate: 24000, audioDuration: 0, isGenerating: false,
+            transition: transition || (num === 1 ? 'none' : 'fade'), error: null
+        });
+        const txt = (x, y, w, h, lines, anim, extra) => ({
+            id: crypto.randomUUID(), type: 'text', x, y, w, h,
+            fillColor: null, lineColor: null, vAlign: 'ctr', lines,
+            animation: anim || { type: 'fadeIn', delay: 0, duration: 0.8 }, ...(extra || {})
+        });
+        const demo = [
+            mkSlide(1, [
+                txt(140, 180, 1000, 130, [{ text: 'Ласкаво просимо до Studio Pro 👋', color: '#1e293b', fontSize: 52, bold: true, align: 'ctr' }]),
+                txt(240, 340, 800, 90, [{ text: 'Це демо-проєкт: редагуйте текст подвійним кліком, тягніть об\'єкти, озвучуйте та експортуйте у відео', color: '#64748b', fontSize: 24, bold: false, align: 'ctr' }], { type: 'floatIn', delay: 0.6, duration: 0.8 })
+            ], 'Привіт! Це демонстраційний проєкт Studio Pro. Спробуйте відредагувати текст, додати анімації та озвучити слайди.'),
+            mkSlide(2, [
+                txt(140, 90, 1000, 90, [{ text: 'Формули та анімації', color: '#1e293b', fontSize: 40, bold: true, align: 'ctr' }]),
+                txt(240, 240, 800, 100, [{
+                    text: 'Площа кола: S=πr²', align: 'ctr',
+                    runs: [
+                        { text: 'Площа кола: ', color: '#334155', fontSize: 32, bold: false },
+                        { text: 'S=πr²', color: '#7c3aed', fontSize: 32, italic: true, math: true, mathml: '<math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mi>S</mi><mo>=</mo><mi>π</mi><msup><mrow><mi>r</mi></mrow><mrow><mn>2</mn></mrow></msup></math>' }
+                    ]
+                }], { type: 'zoomIn', delay: 0.4, duration: 0.8 }),
+                { id: crypto.randomUUID(), type: 'shape', shapeKind: 'star5', x: 560, y: 420, w: 160, h: 160, fillColor: '#facc15', lineColor: '#eab308', lineWidth: 2, animation: { type: 'spinIn', delay: 1.2, duration: 1 }, exitAnimation: { type: 'fadeOut', at: 6, duration: 0.8 } }
+            ], 'Формули з PowerPoint конвертуються у живий MathML, а кожен об\'єкт має анімації появи та зникнення.')
+        ];
+        dispatchVideo({ type: 'SET_SLIDES', slides: demo });
+        setSelectedSlideId(demo[0].id);
+        setSelectedObjectId(null);
+        toast('success', 'Демо-проєкт створено — експериментуйте!');
+        logChange('Демо', 'Створено демонстраційний проєкт');
+    };
+    const voiceSampleCacheRef = useRef(new Map());                   // U-63 voice -> {base64, sampleRate}
+    const [voiceSampleLoading, setVoiceSampleLoading] = useState(false);
+
+    // U-26: перетягування слайдів у панелі сцен (перенумерація зберігається)
+    const reorderSlides = (from, to) => {
+        if (from == null || to == null || from === to) return;
+        const next = [...slides];
+        const [moved] = next.splice(from, 1);
+        next.splice(to, 0, moved);
+        dispatchVideo({ type: 'SET_SLIDES', slides: next.map((sl, i) => ({ ...sl, slideNumber: i + 1 })) });
+        logChange('Слайд', `Слайд переміщено: ${from + 1} → ${to + 1}`);
+    };
+
+    // U-40/U-41: вирівнювання та рівномірний розподіл виділених об'єктів
+    const alignSelected = (mode) => {
+        const slide = slides.find(sl => sl.id === selectedSlideId);
+        if (!slide || multiSelectedIds.length < 2) return;
+        const objs = multiSelectedIds.map(id => slide.objects.find(o => o.id === id)).filter(Boolean);
+        if (objs.length < 2) return;
+        const minX = Math.min(...objs.map(o => o.x)), maxX = Math.max(...objs.map(o => o.x + o.w));
+        const minY = Math.min(...objs.map(o => o.y)), maxY = Math.max(...objs.map(o => o.y + o.h));
+        const moves = {};
+        if (mode === 'distH' || mode === 'distV') {
+            const horiz = mode === 'distH';
+            const sorted = [...objs].sort((a, b) => (horiz ? a.x - b.x : a.y - b.y));
+            const total = horiz ? maxX - minX : maxY - minY;
+            const sumSize = sorted.reduce((acc, o) => acc + (horiz ? o.w : o.h), 0);
+            const gap = (total - sumSize) / (sorted.length - 1);
+            let cursor = horiz ? minX : minY;
+            for (const o of sorted) {
+                moves[o.id] = horiz ? { x: Math.round(cursor), y: o.y } : { x: o.x, y: Math.round(cursor) };
+                cursor += (horiz ? o.w : o.h) + gap;
+            }
+        } else {
+            for (const o of objs) {
+                let x = o.x, y = o.y;
+                if (mode === 'l') x = minX;
+                else if (mode === 'cx') x = Math.round((minX + maxX) / 2 - o.w / 2);
+                else if (mode === 'r') x = maxX - o.w;
+                else if (mode === 't') y = minY;
+                else if (mode === 'cy') y = Math.round((minY + maxY) / 2 - o.h / 2);
+                else if (mode === 'b') y = maxY - o.h;
+                moves[o.id] = { x, y };
+            }
+        }
+        dispatchVideo({ type: 'MOVE_OBJECTS', slideId: slide.id, moves });
+        logChange('Об\'єкт', `Вирівнювання (${mode}): ${objs.length} об'єктів`);
+    };
+
+    // U-38: рамкове виділення по порожньому місцю канваса
+    const startMarquee = (e) => {
+        if (!workspaceRef.current) return;
+        const host = workspaceRef.current.getBoundingClientRect();
+        const sx = e.clientX - host.left, sy = e.clientY - host.top;
+        setSelectedObjectId(null);
+        setMultiSelectedIds([]);
+        const calc = (ev) => ({
+            x: Math.min(sx, ev.clientX - host.left),
+            y: Math.min(sy, ev.clientY - host.top),
+            w: Math.abs(ev.clientX - host.left - sx),
+            h: Math.abs(ev.clientY - host.top - sy)
+        });
+        const move = (ev) => setMarqueeRect(calc(ev));
+        const up = (ev) => {
+            window.removeEventListener('mousemove', move);
+            window.removeEventListener('mouseup', up);
+            const r = calc(ev);
+            setMarqueeRect(null);
+            if (r.w < 6 && r.h < 6) return; // це був просто клік — зняти виділення
+            const sc = editorScaleRef.current || 1;
+            const rx = r.x / sc, ry = r.y / sc, rw = r.w / sc, rh = r.h / sc;
+            const slide = slides.find(sl => sl.id === selectedSlideId);
+            if (!slide) return;
+            const hit = slide.objects
+                .filter(o => o.x < rx + rw && o.x + o.w > rx && o.y < ry + rh && o.y + o.h > ry)
+                .map(o => o.id);
+            if (hit.length === 1) { setSelectedObjectId(hit[0]); setMultiSelectedIds([]); }
+            else if (hit.length > 1) { setMultiSelectedIds(hit); setSelectedObjectId(null); }
+        };
+        window.addEventListener('mousemove', move);
+        window.addEventListener('mouseup', up);
+    };
+
+    // U-63: прослуховування зразка голосу (кешується на сесію)
+    const playVoiceSample = async (voiceSel) => {
+        if (voiceSampleLoading) return;
+        try {
+            setVoiceSampleLoading(true);
+            let sample = voiceSampleCacheRef.current.get(voiceSel);
+            if (!sample) {
+                const phrase = voiceSel.endsWith('-UK') ? 'Hello! This is how my voice sounds.'
+                    : voiceSel.endsWith('-DE') ? 'Hallo! So klingt meine Stimme.'
+                        : 'Привіт! Ось так звучить мій голос.';
+                sample = await fetchTTSWithRetry(phrase, voiceSel, '', 2);
+                voiceSampleCacheRef.current.set(voiceSel, sample);
+            }
+            const ctx = getLiveAudioCtx();
+            const buf = base64ToAudioBuffer(ctx, sample.base64, sample.sampleRate);
+            const srcNode = ctx.createBufferSource();
+            srcNode.buffer = buf;
+            srcNode.connect(ctx.destination);
+            srcNode.start();
+        } catch (e) {
+            toast('error', humanizeTtsError(e.message));
+        } finally {
+            setVoiceSampleLoading(false);
+        }
+    };
+
+    // U-05: проєкт як файл .atmo (JSON зі вшитими медіа) — Ctrl+S / кнопка в панелі сцен
+    const saveProjectToFile = async () => {
+        if (!slides.length) return;
+        try {
+            const data = { studioProVideo: 2, exportedAt: Date.now(), slides: await serializeSlidesForEmbed(slides) };
+            const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'presentation.atmo';
+            a.click();
+            setTimeout(() => URL.revokeObjectURL(url), 1000);
+            toast('success', 'Проєкт збережено у файл .atmo');
+            logChange('Проєкт', 'Збережено у файл .atmo', { slides: slides.length });
+        } catch (e) { toast('error', 'Не вдалося зберегти проєкт: ' + e.message); }
+    };
+    const openProjectFile = async (file) => {
+        try {
+            const data = JSON.parse(await file.text());
+            if (!data.slides || !data.slides.length) throw new Error('файл не містить проєкту');
+            const { slides: revived, deadMedia } = reviveEmbeddedSlides(data.slides);
+            dispatchVideo({ type: 'SET_SLIDES', slides: revived });
+            setSelectedSlideId(revived[0]?.id || null);
+            setSelectedObjectId(null);
+            if (deadMedia > 0) toast('error', `Не відновлено медіа: ${deadMedia} (файл зі старої версії)`);
+            toast('success', `Проєкт відкрито: ${revived.length} слайд(ів)`);
+            logChange('Проєкт', `Відкрито файл .atmo: "${file.name}"`, { slides: revived.length });
+        } catch (e) { toast('error', 'Не вдалося відкрити .atmo: ' + e.message); }
+    };
+
     const [pauseSeconds, setPauseSeconds] = useState(1);             // тривалість паузи (сек), яку вставляє кнопка [ПАУЗА]
     const updateVideoVoice2 = (updates) => {
         setVideoVoice2(prev => ({ ...prev, ...updates }));
@@ -3749,6 +4874,10 @@ export default function VideoEditor() {
                     dispatchVideo({ type: 'DELETE_OBJECTS', slideId: selectedSlideId, objectIds: ids });
                     setSelectedObjectId(null);
                     setMultiSelectedIds([]);
+                    // U-08: скасування видалення об'єктів одним кліком
+                    toast('info', ids.length === 1 ? 'Об\'єкт видалено' : `Видалено об'єктів: ${ids.length}`, {
+                        action: { label: 'Повернути', onClick: () => dispatchVideo({ type: 'UNDO' }) }
+                    });
                 }
                 return;
             }
@@ -3793,6 +4922,22 @@ export default function VideoEditor() {
                 return;
             }
 
+            if (e.key === '?') { e.preventDefault(); setShortcutsOpen(true); return; } // U-72
+
+            if (ctrl && e.key === 's') { e.preventDefault(); saveProjectToFile(); return; } // U-76
+
+            if (e.key === 'Tab' && selectedSlideId) { // U-45: обхід об'єктів слайда
+                const slide = slides.find(sl => sl.id === selectedSlideId);
+                if (slide && slide.objects.length) {
+                    e.preventDefault();
+                    const i = slide.objects.findIndex(o => o.id === selectedObjectId);
+                    const next = slide.objects[(i + (shift ? -1 : 1) + slide.objects.length) % slide.objects.length];
+                    setSelectedObjectId(next.id);
+                    setMultiSelectedIds([]);
+                }
+                return;
+            }
+
             const step = shift ? 10 : 1;
             if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key) && selectedSlideId) {
                 e.preventDefault();
@@ -3819,19 +4964,34 @@ export default function VideoEditor() {
      * ====================================================================== */
 
     const processPPTXFile = async (file) => {
+        // U-17: зрозуміла відмова ДО парсингу (не .pptx / пошкоджений ZIP)
+        const check = await validatePptxFile(file);
+        if (!check.ok) {
+            setFileError(check.reason);
+            toast('error', check.reason);
+            return;
+        }
+        // U-97: великі презентації підтримуються, але чесно попереджаємо про час
+        if (file.size > 150 * 1024 * 1024) {
+            toast('info', `Великий файл (${Math.round(file.size / 1024 / 1024)} МБ) — імпорт може тривати кілька хвилин, вкладку не закривайте`, { duration: 8000 });
+        }
         setIsProcessingPPTX(true);
         setFileError(null);
         try {
-            const extracted = await extractPptxData(file);
+            const extracted = await extractPptxData(file, setImportProgress);
             dispatchVideo({ type: 'SET_SLIDES', slides: extracted });
             setSelectedSlideId(extracted[0]?.id || null);
             setSelectedObjectId(null);
+            setRestoreSnapshot(null); // імпортовано новий проєкт — банер відновлення більше не актуальний
+            toast('success', `Імпортовано «${file.name}»: ${extracted.length} слайд(ів)`);
             logChange('Імпорт', `Завантажено файл "${file.name}"`, { slides: extracted.length });
         } catch (err) {
             setFileError("Помилка читання PPTX: " + err.message);
+            toast('error', 'Не вдалося прочитати PPTX: ' + err.message);
             logChange('Помилка', `Не вдалося прочитати PPTX "${file.name}"`, err.message);
         } finally {
             setIsProcessingPPTX(false);
+            setImportProgress(null);
         }
     };
 
@@ -3893,9 +5053,17 @@ export default function VideoEditor() {
                 });
             }
         } else {
+            // U-51: Shift під час resize — збереження пропорцій
+            let nw = Math.max(20, Math.round(d.origW + dx));
+            let nh = Math.max(20, Math.round(d.origH + dy));
+            if (e.shiftKey && d.origW > 0 && d.origH > 0) {
+                const k = Math.max(nw / d.origW, nh / d.origH);
+                nw = Math.max(20, Math.round(d.origW * k));
+                nh = Math.max(20, Math.round(d.origH * k));
+            }
             dispatchVideo({
                 type: 'UPDATE_OBJECT', slideId: d.slideId, objectId: d.objectId,
-                updates: { w: Math.max(20, Math.round(d.origW + dx)), h: Math.max(20, Math.round(d.origH + dy)) }
+                updates: { w: nw, h: nh }
             });
         }
     }, [slides]);
@@ -3919,6 +5087,11 @@ export default function VideoEditor() {
     const startObjectDrag = (e, slideId, obj, mode) => {
         e.preventDefault();
         e.stopPropagation();
+        if (obj.locked) { // U-53: закріплений об'єкт можна виділити, але не зсунути
+            setSelectedObjectId(obj.id);
+            setMultiSelectedIds([]);
+            return;
+        }
         const isInMulti = multiSelectedIds.includes(obj.id);
         const wasSelected = selectedObjectId === obj.id && !isInMulti && !e.shiftKey;
         if (!e.shiftKey && !isInMulti) {
@@ -4033,9 +5206,11 @@ export default function VideoEditor() {
                     sampleRate = sr;
                 }
 
-                // Двомовний текст озвучуємо фрагментами: кожне речення — голосом своєї
-                // мови (укр -> український, англ -> британська англійська)
-                for (const langPart of splitTextByLanguage(seg.text)) {
+                // U-102: підставляємо словник вимови (лише для диктора — текст слайдів
+                // не змінюється), далі двомовний текст озвучуємо фрагментами: кожне
+                // речення — голосом своєї мови (укр -> український, англ -> британська)
+                const spokenText = applyPronunciationDict(seg.text, pronDict);
+                for (const langPart of splitTextByLanguage(spokenText)) {
                     const res = await fetchTTSWithRetry(langPart.text, pickVoiceForText(vp.voice, langPart.text), buildStyleDirection(vp.rate, vp.style));
                     parts.push(res.base64);
                     sampleRate = res.sampleRate;
@@ -4056,21 +5231,67 @@ export default function VideoEditor() {
             logChange('Озвучка', `Згенеровано аудіо слайда ${slide.slideNumber}${videoDialog ? ' (2 диктори)' : ''}`, { duration: `${dur.toFixed(1)}с`, voice: videoVoice.voice });
             // Анімації більше не скидаються автоматично при переозвучці!
         } catch (e) {
-            dispatchVideo({ type: 'UPDATE_SLIDE', slideId, updates: { isGenerating: false, error: e.message } });
+            const human = humanizeTtsError(e.message); // U-21: зрозуміле пояснення замість коду помилки
+            dispatchVideo({ type: 'UPDATE_SLIDE', slideId, updates: { isGenerating: false, error: human } });
+            toast('error', `Слайд ${slide.slideNumber}: ${human}`);
             logChange('Помилка', `Озвучка слайда ${slide.slideNumber} не вдалася`, e.message);
         }
     };
 
     const generateAllMissingSlidesAudio = async () => {
         setIsGeneratingAll(true);
+        cancelGenerationRef.current = false;
         const toGenerate = slides.filter(s => s.text.trim() && !s.audioBase64);
+        if (toGenerate.length) {
+            // U-69: чергу можна зупинити — вже озвучені слайди зберігаються
+            toast('info', `Озвучуємо ${toGenerate.length} слайд(ів)… Редагувати інші слайди можна далі.`, {
+                duration: 8000,
+                action: { label: 'Зупинити', onClick: () => { cancelGenerationRef.current = true; } }
+            });
+        }
+        let done = 0;
         for (const slide of toGenerate) {
+            if (cancelGenerationRef.current) break;
             await generateSlideAudio(slide.id);
+            done++;
+        }
+        if (toGenerate.length) {
+            toast(cancelGenerationRef.current ? 'info' : 'success',
+                cancelGenerationRef.current ? `Озвучку зупинено (готово ${done} з ${toGenerate.length})` : 'Пакетну озвучку завершено'); // U-20
         }
         setIsGeneratingAll(false);
     };
 
     // --- AI-Оркестратор: сценарій диктора + переходи + анімації об'єктів ---
+
+    // U-107: аудит плану від AI перед застосуванням. Невалідні позиції (невідомі
+    // objectId, типи анімацій, зайві слайди) reducer і так відкидає — тут вони
+    // рахуються і показуються користувачу, а не губляться мовчки.
+    const auditAiPlan = (plan) => {
+        if (!Array.isArray(plan)) return;
+        const slideByNumber = new Map(slides.map(s => [s.slideNumber, s]));
+        let unknownSlides = 0, unknownObjects = 0, unknownTypes = 0;
+        for (const item of plan) {
+            if (!item) continue;
+            const sl = slideByNumber.get(item.slideNumber);
+            if (!sl) { unknownSlides++; continue; }
+            const ids = new Set(sl.objects.map(o => o.id));
+            for (const a of (item.animations || [])) {
+                if (!a) continue;
+                if (a.objectId && !ids.has(a.objectId)) unknownObjects++;
+                else if (a.type && !ANIMATIONS[a.type]) unknownTypes++;
+            }
+        }
+        const total = unknownSlides + unknownObjects + unknownTypes;
+        if (total > 0) {
+            const parts = [];
+            if (unknownObjects) parts.push(`${unknownObjects} анімацій з невідомими об'єктами`);
+            if (unknownTypes) parts.push(`${unknownTypes} невідомих типів`);
+            if (unknownSlides) parts.push(`${unknownSlides} зайвих слайдів`);
+            toast('info', `План AI застосовано частково — відкинуто: ${parts.join(', ')}`);
+            logChange('AI', 'Частина AI-плану відкинута валідацією', { unknownSlides, unknownObjects, unknownTypes });
+        }
+    };
 
     const handleAiAutoScript = async () => {
         if (slides.length === 0) return;
@@ -4097,7 +5318,7 @@ export default function VideoEditor() {
                 }))
             }));
 
-            const prompt = `Ти — режисер та сценарист відеопрезентацій. Ось слайди презентації з нотатками доповідача та списком об'єктів кожного слайду (id, тип, зміст, координати на канвасі 1280x720):\n\n${JSON.stringify(slidesSummary, null, 2)}\n\nДля КОЖНОГО слайду виконай:\n1. "narration" — текст диктора: природний усний коментар тією ж мовою, що й вміст слайду. Якщо вже є "existingNarration", доопрацюй і покращи його; якщо немає — створи з нуля на основі об'єктів слайду. Текст має звучати як жива розповідь, а не дослівне читання слайду. Орієнтовна тривалість озвучки слайду — 10–25 секунд.\n2. "transition" — перехід до цього слайду від попереднього, одне значення зі списку: ${transitionKeys.join(', ')}. Для першого слайду — "none". Урізноманітнюй переходи, але для текстонасичених слайдів обирай спокійні ("fade", "none").\n3. "animations" — масив анімацій появи для об'єктів слайду. Для кожного об'єкта вкажи: "objectId" (точний id зі списку), "type" (одне зі: ${animationKeys.join(', ')}), "delay" (секунди від початку слайду, число) та "duration" (тривалість ефекту 0.4–1.5 с). КЛЮЧОВЕ: синхронізуй появу об'єктів зі змістом narration — заголовок з'являється одразу (delay 0), а тези/зображення поступово, у момент, коли диктор орієнтовно говорить про них (рахуй ~2.5 слова narration за секунду). Не залишай великих "порожніх" пауз. Кожен objectId згадай не більше одного разу.\n\nПоверни JSON-масив об'єктів {"slideNumber", "narration", "transition", "animations"} для КОЖНОГО слайду в тому ж порядку, без додаткових коментарів.`;
+            const prompt = `Ти — режисер та сценарист відеопрезентацій. Ось слайди презентації з нотатками доповідача та списком об'єктів кожного слайду (id, тип, зміст, координати на канвасі 1280x720):\n\n${JSON.stringify(slidesSummary, null, 2)}\n\nДля КОЖНОГО слайду виконай:\n1. "narration" — текст диктора: природний усний коментар тією ж мовою, що й вміст слайду. Якщо вже є "existingNarration", доопрацюй і покращи його; якщо немає — створи з нуля на основі об'єктів слайду. Текст має звучати як жива розповідь, а не дослівне читання слайду. Орієнтовна тривалість озвучки слайду — 10–25 секунд. ВАЖЛИВО: narration слайда описує ЛИШЕ об\'єкти цього слайда (не переносить вміст сусідніх). Слайд 1 — титульний: для нього narration — коротке привітання і назва теми (1–2 речення), без переліку вмісту презентації.\n2. "transition" — перехід до цього слайду від попереднього, одне значення зі списку: ${transitionKeys.join(', ')}. Для першого слайду — "none". Урізноманітнюй переходи, але для текстонасичених слайдів обирай спокійні ("fade", "none").\n3. "animations" — масив анімацій появи для об'єктів слайду. Для кожного об'єкта вкажи: "objectId" (точний id зі списку), "type" (одне зі: ${animationKeys.join(', ')}), "delay" (секунди від початку слайду, число) та "duration" (тривалість ефекту 0.4–1.5 с). КЛЮЧОВЕ: синхронізуй появу об'єктів зі змістом narration — заголовок з'являється одразу (delay 0), а тези/зображення поступово, у момент, коли диктор орієнтовно говорить про них (рахуй ~2.5 слова narration за секунду). Не залишай великих "порожніх" пауз. Кожен objectId згадай не більше одного разу.\n\nПоверни JSON-масив об'єктів {"slideNumber", "narration", "transition", "animations"} для КОЖНОГО слайду в тому ж порядку, без додаткових коментарів.`;
 
             const response = await fetch(url, {
                 method: 'POST',
@@ -4141,6 +5362,7 @@ export default function VideoEditor() {
             if (!rawText) throw new Error('Порожня відповідь від ШІ');
 
             const plan = JSON.parse(rawText);
+            auditAiPlan(plan);
             dispatchVideo({ type: 'APPLY_AI_PLAN', plan });
             logChange('AI-сценарій', `Згенеровано сценарій, переходи й анімації для ${slides.length} слайд(ів)`);
         } catch (err) {
@@ -4223,6 +5445,7 @@ export default function VideoEditor() {
             if (!rawText) throw new Error('Порожня відповідь від ШІ');
 
             const plan = JSON.parse(rawText);
+            auditAiPlan(plan);
             dispatchVideo({ type: 'APPLY_AI_PLAN', plan });
             logChange('AI-асистент', 'Застосовано інструкцію монтажу', assistantPrompt.trim());
             setAssistantPrompt('');
@@ -4517,6 +5740,7 @@ export default function VideoEditor() {
                     animations: item.animations || []
                 };
             });
+            auditAiPlan(plan);
             dispatchVideo({ type: 'APPLY_AI_PLAN', plan, keepAudio: true });
             logChange('Анімації', `Авто-анімації за запитом: "${userReq}"`);
             setAnimPrompt('');
@@ -4533,11 +5757,18 @@ export default function VideoEditor() {
 
     const reimportPPTXFile = async (file) => {
         if (!file) return;
+        // U-17 + U-10: валідація файлу та підтвердження перезапису правок канваса
+        const check = await validatePptxFile(file);
+        if (!check.ok) { toast('error', check.reason); return; }
+        if (slides.length > 0 && !window.confirm(
+            'Оновити презентацію з PPTX?\n\nТексти диктора, переходи та озвучка збережуться, ' +
+            'але зміни обʼєктів на слайдах (переміщення, стилі, додані елементи) буде замінено вмістом файлу.'
+        )) return;
         stopPreview();
         setIsProcessingPPTX(true);
         setFileError(null);
         try {
-            const extracted = await extractPptxData(file);
+            const extracted = await extractPptxData(file, setImportProgress);
             const prevBySlideNumber = new Map(slides.map(s => [s.slideNumber, s]));
             const prevSelectedNumber = selectedSlide ? selectedSlide.slideNumber : null;
 
@@ -4558,12 +5789,15 @@ export default function VideoEditor() {
             const reselected = merged.find(s => s.slideNumber === prevSelectedNumber) || merged[0];
             setSelectedSlideId(reselected ? reselected.id : null);
             setSelectedObjectId(null);
+            toast('success', `Оновлено з «${file.name}»: тексти, озвучку й переходи збережено`);
             logChange('Імпорт', `Оновлено з PPTX "${file.name}" (текст, озвучка й переходи збережені)`, { slides: merged.length });
         } catch (err) {
             setFileError("Помилка повторної конвертації: " + err.message);
+            toast('error', 'Не вдалося оновити з PPTX: ' + err.message);
             logChange('Помилка', 'Повторна конвертація PPTX не вдалася', err.message);
         } finally {
             setIsProcessingPPTX(false);
+            setImportProgress(null);
         }
     };
 
@@ -4623,6 +5857,8 @@ export default function VideoEditor() {
                             if (tl) { const cursor = tl.querySelector('.scrub-cursor'); if (cursor) cursor.style.opacity = '0'; }
                         }}
                     >
+                        {/* U-62: хвиля озвучки слайда — фоновим шаром */}
+                        {slide.audioBase64 && <WaveformCanvas base64={slide.audioBase64} />}
                         {/* Ruler marks */}
                         <div className="absolute top-0 left-0 right-0 h-4 border-b border-slate-200 pointer-events-none">
                             {secMarks.map(s => (
@@ -4739,10 +5975,32 @@ export default function VideoEditor() {
             setSelectedSlideId(fallback ? fallback.id : null);
             setSelectedObjectId(null);
         }
+        // U-07: видалення можна миттєво скасувати прямо зі снекбара
+        toast('info', `Слайд ${idx + 1} видалено`, {
+            action: { label: 'Повернути', onClick: () => dispatchVideo({ type: 'UNDO' }) }
+        });
         logChange('Слайд', `Видалено слайд ${idx + 1}`);
     };
 
     // --- Додавання власних об'єктів ---
+
+    // Бігучий рядок (титри в кінці слайда): типово на останній слайд,
+    // з'являється за 5с до кінця озвучки
+    const addTicker = () => {
+        if (!selectedSlide) return;
+        const object = {
+            id: crypto.randomUUID(), type: 'ticker',
+            x: 0, y: 630, w: 1280, h: 70,
+            text: 'Дякуємо за перегляд! 👋 Тут може бути ваш текст — змініть його в панелі праворуч.',
+            color: '#ffffff', fillColor: 'rgba(15, 23, 42, 0.85)', fontSize: 32,
+            startBeforeEnd: 5,
+            animation: { type: 'none', delay: 0, duration: 0.5 }
+        };
+        dispatchVideo({ type: 'ADD_OBJECT', slideId: selectedSlide.id, object });
+        setSelectedObjectId(object.id);
+        toast('info', 'Бігучий рядок додано: з\'явиться за 5с до кінця озвучки слайда (налаштуйте в панелі)');
+        logChange('Об\'єкт', `Додано бігучий рядок на слайд ${selectedSlide.slideNumber}`);
+    };
 
     const addTextObject = () => {
         if (!selectedSlide) return;
@@ -4837,6 +6095,7 @@ export default function VideoEditor() {
         const base = { id: crypto.randomUUID(), type: 'interactive', iType, color: '#7c3aed', x: 320, y: 240, animation: { type: 'none', delay: 0, duration: 0.5 } };
         const D = {
             hotspot: { x: 600, y: 320, w: 56, h: 56, label: 'i', content: 'Текст підказки' },
+            fact: { x: 420, y: 180, w: 440, h: 300, title: 'Цікавий факт', content: 'Додайте текст факту, а вище — картинку.', image: null },
             mcq: { w: 460, h: 230, question: 'Ваше питання?', options: ['Варіант 1', 'Варіант 2', 'Варіант 3'], correct: 0 },
             summary: { w: 460, h: 230, question: 'Оберіть правильне твердження:', options: ['Хибне твердження', 'Правильне твердження', 'Ще одне хибне'], correct: 1 },
             truefalse: { w: 420, h: 150, question: 'Це твердження правдиве?', correct: true },
@@ -4983,7 +6242,7 @@ export default function VideoEditor() {
             playingSlideSourceRef.current = null;
         }
         if (playingSlideId === id) { setPlayingSlideId(null); return; }
-        if (!currentCtx) currentCtx = new (window.AudioContext || window.webkitAudioContext)();
+        getLiveAudioCtx(); // U-105: авто-відновлення після suspend/closed
         const buffer = base64ToAudioBuffer(currentCtx, base64PCM, sampleRate);
         const source = currentCtx.createBufferSource();
         source.buffer = buffer;
@@ -5023,7 +6282,7 @@ export default function VideoEditor() {
             await playSlideVideos(slide);
 
             if (slide.audioBase64) {
-                if (!currentCtx) currentCtx = new (window.AudioContext || window.webkitAudioContext)();
+                getLiveAudioCtx(); // U-105: авто-відновлення після suspend/closed
                 const buffer = base64ToAudioBuffer(currentCtx, slide.audioBase64, slide.sampleRate);
                 source = currentCtx.createBufferSource();
                 source.buffer = buffer;
@@ -5082,9 +6341,9 @@ export default function VideoEditor() {
             const segments = [];
             let prev = null;
             for (const s of slides) {
-                const def = TRANSITIONS[s.transition] || TRANSITIONS.none;
-                if (prev && def.duration > 0) {
-                    segments.push({ kind: 'transition', prev, next: s, type: s.transition, dur: def.duration });
+                const tDur = getTransitionDuration(s);
+                if (prev && tDur > 0) {
+                    segments.push({ kind: 'transition', prev, next: s, type: s.transition, dur: tDur });
                 }
                 segments.push({ kind: 'slide', slide: s, dur: getSlideDuration(s) });
                 prev = s;
@@ -5120,7 +6379,7 @@ export default function VideoEditor() {
                     playingVideoSlide = seg.slide;
                     if (source) { try { source.stop(); } catch (e) { /* вже зупинено */ } source = null; }
                     if (seg.slide.audioBase64) {
-                        if (!currentCtx) currentCtx = new (window.AudioContext || window.webkitAudioContext)();
+                        getLiveAudioCtx(); // U-105: авто-відновлення після suspend/closed
                         const buffer = base64ToAudioBuffer(currentCtx, seg.slide.audioBase64, seg.slide.sampleRate);
                         source = currentCtx.createBufferSource();
                         source.buffer = buffer;
@@ -5191,6 +6450,258 @@ export default function VideoEditor() {
     };
 
     // opts: { withAudio } — withAudio:false → відео без звуку
+    // ═══ ШВИДКИЙ ЕКСПОРТ (WebCodecs): кадри кодуються так швидко, як малюються —
+    // 5–10× швидше реального часу для слайдів без відео. Аудіо (озвучка + звук
+    // вбудованих відео) рендериться миттєво через OfflineAudioContext, кадри —
+    // VideoEncoder H.264, контейнер — mp4-muxer (вантажиться з CDN, як JSZip).
+    // Якщо браузер не підтримує WebCodecs/AAC — автоматичний фолбек на звичайний
+    // експорт у реальному часі (MediaRecorder). ═══
+    const loadMp4Muxer = () => new Promise((res, rej) => {
+        if (window.Mp4Muxer) return res(window.Mp4Muxer);
+        const sc = document.createElement('script');
+        sc.src = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.1.5/build/mp4-muxer.min.js';
+        sc.onload = () => res(window.Mp4Muxer);
+        sc.onerror = rej;
+        document.head.appendChild(sc);
+    });
+
+    // Точне позиціювання кадру вбудованих відео: сік до потрібної секунди
+    // (детермінований рендер замість відтворення в реальному часі)
+    const seekSlideVideosTo = async (slide, tLocal) => {
+        const vids = (slide.objects || []).filter(o => o.type === 'video' && o.src);
+        for (const o of vids) {
+            const v = videoCache.get(o.src);
+            if (!v || !(v.duration > 0)) continue;
+            const ts = o.trimStart || 0;
+            const te = (o.trimEnd != null && o.trimEnd > ts) ? o.trimEnd : v.duration;
+            const span = Math.max(te - ts, 0.1);
+            const local = tLocal - ((o.animation && o.animation.delay) || 0);
+            if (local < 0) continue;
+            const fit = o.videoFitMode || 'loop';
+            let target;
+            if (fit === 'stretch') target = ts + Math.min((local / Math.max(tLocal, 0.01)) * span, span);
+            else if (fit === 'trim') target = Math.min(ts + local, te - 0.03);
+            else target = ts + (local % span); // loop
+            target = Math.max(0, Math.min(target, v.duration - 0.03));
+            if (Math.abs(v.currentTime - target) < 0.02) continue;
+            await new Promise(resolve => {
+                let done = false;
+                const fin = () => { if (!done) { done = true; v.removeEventListener('seeked', fin); resolve(); } };
+                v.addEventListener('seeked', fin);
+                setTimeout(fin, 250);
+                try { v.currentTime = target; } catch (e) { fin(); }
+            });
+        }
+    };
+
+    const handleExportVideoFast = async (opts = {}) => {
+        if (slides.length === 0 || isVideoExportingRef.current) return;
+        const withAudio = (opts && opts.withAudio) !== false;
+
+        // Перевірка можливостей браузера; інакше — чесний фолбек на повільний шлях
+        let videoOk = false, audioOk = !withAudio;
+        try {
+            if (typeof window.VideoEncoder === 'function') {
+                videoOk = (await VideoEncoder.isConfigSupported({ codec: 'avc1.640028', width: 1920, height: 1080, bitrate: 9e6, framerate: 30 })).supported;
+            }
+            if (withAudio && typeof window.AudioEncoder === 'function') {
+                audioOk = (await AudioEncoder.isConfigSupported({ codec: 'mp4a.40.2', sampleRate: 48000, numberOfChannels: 2, bitrate: 192000 })).supported;
+            }
+        } catch (e) { /* нижче фолбек */ }
+        if (!videoOk || !audioOk) {
+            toast('info', 'Браузер не підтримує швидке кодування (WebCodecs H.264/AAC) — експортуємо звичайним способом');
+            return handleExportVideo(opts);
+        }
+
+        isVideoExportingRef.current = true;
+        stopPreview();
+        setIsExporting(true);
+        setExportProgress(0);
+        logChange('Експорт', 'Старт ШВИДКОГО експорту (WebCodecs) 1080p', { withAudio, slides: slides.length });
+        const fps = 30;
+        const exportStart = performance.now();
+        try {
+            const Mp4Muxer = await loadMp4Muxer();
+            for (const slide of slides) await preloadSlideImages(slide);
+
+            // Розклад: [перехід] -> слайд -> ... (як у прев'ю), час старту кожного слайда
+            const segments = [];
+            let cursor = 0;
+            slides.forEach((sl, i) => {
+                const tDur = i > 0 ? getTransitionDuration(sl) : 0;
+                if (tDur > 0) { segments.push({ kind: 'transition', prev: slides[i - 1], slide: sl, start: cursor, dur: tDur }); cursor += tDur; }
+                const dur = getSlideDuration(sl);
+                segments.push({ kind: 'slide', slide: sl, start: cursor, dur });
+                cursor += dur;
+            });
+            const totalSec = cursor;
+
+            // ── Аудіо: офлайн-мікс (миттєво, без відтворення) ──
+            let audioBuffer = null;
+            if (withAudio) {
+                const SR = 48000;
+                const off = new OfflineAudioContext(2, Math.max(1, Math.ceil(totalSec * SR)), SR);
+                for (const seg of segments) {
+                    if (seg.kind !== 'slide') continue;
+                    const sl = seg.slide;
+                    if (sl.audioBase64) { // озвучка (PCM -> буфер)
+                        try {
+                            const buf = base64ToAudioBuffer(off, sl.audioBase64, sl.sampleRate);
+                            const src = off.createBufferSource();
+                            src.buffer = buf; src.connect(off.destination); src.start(seg.start);
+                        } catch (e) { /* слайд без озвучки */ }
+                    }
+                    for (const o of (sl.objects || [])) { // звук вбудованих відео/аудіо
+                        if ((o.type !== 'video' && o.type !== 'audio') || !o.src) continue;
+                        try {
+                            const ab = await fetch(o.src).then(r => r.arrayBuffer());
+                            const clip = await off.decodeAudioData(ab.slice(0));
+                            const ts = o.trimStart || 0;
+                            const te = (o.trimEnd != null && o.trimEnd > ts) ? Math.min(o.trimEnd, clip.duration) : clip.duration;
+                            const span = Math.max(te - ts, 0.05);
+                            const delay = (o.animation && o.animation.delay) || 0;
+                            const avail = seg.dur - delay;
+                            if (avail <= 0) continue;
+                            const fit = o.videoFitMode || 'loop';
+                            if (fit === 'loop' && o.type === 'video') {
+                                let at = 0;
+                                while (at < avail - 0.05) {
+                                    const src = off.createBufferSource();
+                                    src.buffer = clip; src.connect(off.destination);
+                                    src.start(seg.start + delay + at, ts, Math.min(span, avail - at));
+                                    at += span;
+                                }
+                            } else {
+                                const src = off.createBufferSource();
+                                src.buffer = clip; src.connect(off.destination);
+                                if (fit === 'stretch' && o.type === 'video') src.playbackRate.value = Math.max(0.05, span / avail);
+                                src.start(seg.start + delay, ts, Math.min(fit === 'stretch' ? span / Math.max(span / avail, 0.05) : span, avail));
+                            }
+                        } catch (e) { /* кліп без аудіодоріжки */ }
+                    }
+                }
+                audioBuffer = await off.startRendering();
+            }
+
+            // ── Мультиплексор і кодери ──
+            const muxer = new Mp4Muxer.Muxer({
+                target: new Mp4Muxer.ArrayBufferTarget(),
+                video: { codec: 'avc', width: 1920, height: 1080 },
+                audio: withAudio ? { codec: 'aac', sampleRate: 48000, numberOfChannels: 2 } : undefined,
+                fastStart: 'in-memory'
+            });
+            let codecErr = null;
+            const vEnc = new VideoEncoder({
+                output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+                error: (e) => { codecErr = e; }
+            });
+            vEnc.configure({ codec: 'avc1.640028', width: 1920, height: 1080, bitrate: 9e6, framerate: fps });
+            let aEnc = null;
+            if (withAudio && audioBuffer) {
+                aEnc = new AudioEncoder({
+                    output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
+                    error: (e) => { codecErr = e; }
+                });
+                aEnc.configure({ codec: 'mp4a.40.2', sampleRate: 48000, numberOfChannels: 2, bitrate: 192000 });
+                // Подаємо аудіо порціями по ~100мс (interleaved f32)
+                const SR = 48000, CH = 2, STEP = 4800;
+                const L = audioBuffer.getChannelData(0);
+                const R = audioBuffer.numberOfChannels > 1 ? audioBuffer.getChannelData(1) : L;
+                for (let i = 0; i < audioBuffer.length; i += STEP) {
+                    const n = Math.min(STEP, audioBuffer.length - i);
+                    const inter = new Float32Array(n * CH);
+                    for (let j = 0; j < n; j++) { inter[j * 2] = L[i + j]; inter[j * 2 + 1] = R[i + j]; }
+                    const ad = new AudioData({
+                        format: 'f32', sampleRate: SR, numberOfFrames: n, numberOfChannels: CH,
+                        timestamp: Math.round((i / SR) * 1e6), data: inter
+                    });
+                    aEnc.encode(ad);
+                    ad.close();
+                }
+            }
+
+            // ── Кадри: детермінований рендер на повній швидкості ──
+            const canvas = document.createElement('canvas');
+            canvas.width = 1920; canvas.height = 1080;
+            const ctx = canvas.getContext('2d');
+            ctx.scale(1920 / CANVAS_W, 1080 / CANVAS_H);
+            const totalFrames = Math.ceil(totalSec * fps);
+            let segIdx = 0;
+            for (let f = 0; f < totalFrames; f++) {
+                if (codecErr) throw codecErr;
+                const t = f / fps;
+                while (segIdx < segments.length - 1 && t >= segments[segIdx].start + segments[segIdx].dur) segIdx++;
+                const seg = segments[segIdx];
+                const local = Math.min(t - seg.start, seg.dur);
+                if (seg.kind === 'transition') {
+                    const prevCanvas = renderSlideToCanvas(seg.prev, getSlideDuration(seg.prev) + 10);
+                    const nextCanvas = renderSlideToCanvas(seg.slide, 0);
+                    drawTransitionFrame(ctx, prevCanvas, nextCanvas, seg.slide.transition, local / seg.dur);
+                } else {
+                    await seekSlideVideosTo(seg.slide, local);
+                    drawSlideFrame(ctx, seg.slide, local);
+                }
+                const frame = new VideoFrame(canvas, { timestamp: Math.round(t * 1e6), duration: Math.round(1e6 / fps) });
+                vEnc.encode(frame, { keyFrame: f % (fps * 2) === 0 });
+                frame.close();
+                // Backpressure: не даємо черзі кодера рости безмежно
+                while (vEnc.encodeQueueSize > 4) await new Promise(r => setTimeout(r, 0));
+                if (f % 15 === 0) {
+                    const pct = f / totalFrames;
+                    setExportProgress(Math.round(pct * 100));
+                    const elapsed = (performance.now() - exportStart) / 1000;
+                    const eta = pct > 0.02 ? (elapsed / pct) * (1 - pct) : 0;
+                    setExportEta(eta ? '~' + formatDuration(eta) : '');
+                    await new Promise(r => setTimeout(r, 0)); // даємо UI дихати
+                }
+            }
+            await vEnc.flush();
+            if (aEnc) await aEnc.flush();
+            muxer.finalize();
+            if (codecErr) throw codecErr;
+
+            const videoBlob = new Blob([muxer.target.buffer], { type: 'video/mp4' });
+            // Звіт відповідності вимогам + швидкість рендера
+            const actualMbps = totalSec > 0 ? (videoBlob.size * 8 / totalSec / 1e6) : 0;
+            const renderSec = (performance.now() - exportStart) / 1000;
+            const speedX = renderSec > 0 ? totalSec / renderSec : 0;
+            toast(actualMbps <= 10.5 ? 'success' : 'error',
+                `⚡ Відео: 1920×1080 · H.264 (MP4) · 30 fps · ${actualMbps.toFixed(1)} Мбіт/с · рендер ${speedX.toFixed(1)}× швидше реального часу`,
+                { duration: 9000 });
+            logChange('Експорт', 'Швидкий експорт (WebCodecs) завершено', {
+                bitrateMbps: Math.round(actualMbps * 100) / 100, renderSec: Math.round(renderSec), speedX: Math.round(speedX * 10) / 10
+            });
+
+            // Вшиваємо проєкт (як у звичайному експорті) і віддаємо файл
+            let finalBlob = videoBlob;
+            try {
+                const snapshot = { studioProVideo: 2, exportedAt: Date.now(), slides: await serializeSlidesForEmbed(slides) };
+                const b64 = btoa(unescape(encodeURIComponent(JSON.stringify(snapshot))));
+                finalBlob = new Blob([videoBlob, `\n${VIDEO_PROJECT_START}\n${b64}\n${VIDEO_PROJECT_END}\n`], { type: 'video/mp4' });
+            } catch (e) { /* завеликий проєкт — чисте відео */ }
+            const fname = `presentation_video_fast${withAudio ? '' : '_silent'}.mp4`;
+            const url = URL.createObjectURL(finalBlob);
+            const a = document.createElement('a');
+            a.href = url; a.download = fname; a.click();
+            setTimeout(() => URL.revokeObjectURL(url), 1000);
+            setExportProgress(100);
+        } catch (err) {
+            logChange('Помилка', 'Швидкий експорт не вдався — фолбек на звичайний', err?.message || String(err));
+            toast('info', 'Швидкий експорт не вдався (' + (err?.message || err) + ') — пробуємо звичайний');
+            isVideoExportingRef.current = false;
+            setIsExporting(false);
+            setExportProgress(0);
+            setExportEta('');
+            return handleExportVideo(opts);
+        } finally {
+            for (const sl of slides) { try { stopSlideVideos(sl); } catch (e) { /* ignore */ } }
+            isVideoExportingRef.current = false;
+            setIsExporting(false);
+            setExportProgress(0);
+            setExportEta('');
+        }
+    };
+
     const handleExportVideo = async (opts = {}) => {
         if (slides.length === 0) return;
         if (isVideoExportingRef.current) return; // вже триває експорт відео — ігноруємо повторний виклик (подвійний клік)
@@ -5287,12 +6798,16 @@ export default function VideoEditor() {
                 }
             };
 
+            // U-23: повна тривалість майбутнього відео (слайди + переходи) для ETA
+            const totalExportSec = slides.reduce((acc, sl, k) =>
+                acc + getSlideDuration(sl) + (k > 0 ? getTransitionDuration(sl) : 0), 0);
+
             let prevSlide = null;
 
             for (let i = 0; i < slides.length; i++) {
                 const slide = slides[i];
                 const slideDuration = getSlideDuration(slide);
-                const transitionDef = TRANSITIONS[slide.transition] || TRANSITIONS.none;
+                const transDur = getTransitionDuration(slide);
 
                 // Спершу ПІДГОТОВКА вбудованих відео та аудіо (асинхронно).
                 await primeSlideVideos(slide);
@@ -5314,11 +6829,11 @@ export default function VideoEditor() {
                 }
 
                 // Анімація переходу: попередній слайд (фінальний стан) -> поточний (стан t=0)
-                if (i > 0 && prevSlide && transitionDef.duration > 0) {
+                if (i > 0 && prevSlide && transDur > 0) {
                     const prevCanvas = renderSlideToCanvas(prevSlide, getSlideDuration(prevSlide) + 10);
                     const nextCanvas = renderSlideToCanvas(slide, 0);
-                    await drawTimed(transitionDef.duration, (t) => {
-                        drawTransitionFrame(ctx, prevCanvas, nextCanvas, slide.transition, t / transitionDef.duration);
+                    await drawTimed(transDur, (t) => {
+                        drawTransitionFrame(ctx, prevCanvas, nextCanvas, slide.transition, t / transDur);
                     });
                 }
 
@@ -5342,7 +6857,10 @@ export default function VideoEditor() {
                 await drawTimed(slideDuration, (t, frame) => {
                     drawSlideFrame(ctx, slide, t);
                     if (frame % 10 === 0) {
-                        setExportProgress(Math.round(((i + t / slideDuration) / slides.length) * 100));
+                        const pct = (i + t / slideDuration) / slides.length;
+                        setExportProgress(Math.round(pct * 100));
+                        // U-23: рендер іде в реальному часі, тож залишок = решта тривалості відео
+                        setExportEta('~' + formatDuration(Math.max(0, totalExportSec * (1 - pct))));
                     }
                 });
                 stopSlideVideos(slide);
@@ -5355,11 +6873,27 @@ export default function VideoEditor() {
             await recordingComplete;
 
             const videoBlob = new Blob(chunks, { type: mimeType });
+            // ── Автоперевірка вимог до відео: 1920x1080 · H.264 · 30fps · ≤10 Мбіт/с ──
+            // Роздільність і fps задані жорстко (canvas 1920x1080, captureStream(30));
+            // кодек і ФАКТИЧНИЙ бітрейт перевіряємо по готовому файлу.
+            const actualMbps = totalExportSec > 0 ? (videoBlob.size * 8 / totalExportSec / 1e6) : 0;
+            const isH264 = extension === 'mp4';
+            const specOk = isH264 && actualMbps <= 10.5;
+            toast(specOk ? 'success' : 'error',
+                `Відео: 1920×1080 · ${isH264 ? 'H.264 (MP4)' : 'WebM — БЕЗ H.264!'} · 30 fps · ${actualMbps.toFixed(1)} Мбіт/с` +
+                (specOk ? ' ✓ відповідає вимогам' : (!isH264 ? '. Для H.264 відкрийте редактор у Chrome або Edge' : ' — бітрейт вище 10 Мбіт/с')),
+                { duration: 9000 });
+            logChange('Експорт', 'Перевірка вимог до відео', {
+                resolution: '1920x1080', codec: mimeType, fps: 30,
+                bitrateMbps: Math.round(actualMbps * 100) / 100, sizeMB: Math.round(videoBlob.size / 1048576), specOk
+            });
             // Вшиваємо проєкт у кінець файлу (маркер + base64 JSON), щоб MP4 можна було
             // відкрити НАЗАД у редакторі (зворотна конвертація). Плеєри ігнорують хвіст.
+            // Медіа (відео/аудіо) вшиваються як data:-URL — blob:-посилання не
+            // переживають перезавантаження сторінки.
             let finalBlob = videoBlob;
             try {
-                const snapshot = { studioProVideo: 1, exportedAt: Date.now(), slides };
+                const snapshot = { studioProVideo: 2, exportedAt: Date.now(), slides: await serializeSlidesForEmbed(slides) };
                 const b64 = btoa(unescape(encodeURIComponent(JSON.stringify(snapshot))));
                 finalBlob = new Blob([videoBlob, `\n${VIDEO_PROJECT_START}\n${b64}\n${VIDEO_PROJECT_END}\n`], { type: mimeType });
             } catch (e) {
@@ -5373,6 +6907,7 @@ export default function VideoEditor() {
             a.download = fname;
             a.click();
             setTimeout(() => URL.revokeObjectURL(url), 1000);
+            toast('success', `Відео готове: ${fname}`); // U-22
             logChange('Експорт', `Відео збережено: ${fname}`, { format: mimeType, resolution: '1920x1080', fps: 30, bitrate: '~9 Mbps' });
 
         } catch (err) {
@@ -5401,6 +6936,7 @@ export default function VideoEditor() {
             isVideoExportingRef.current = false;
             setIsExporting(false);
             setExportProgress(0);
+            setExportEta('');
         }
     };
 
@@ -5410,7 +6946,7 @@ export default function VideoEditor() {
         let t = 0; const placements = [];
         for (let i = 0; i < slides.length; i++) {
             const s = slides[i];
-            if (i > 0) { const td = TRANSITIONS[s.transition] || TRANSITIONS.none; t += td.duration || 0; }
+            if (i > 0) t += getTransitionDuration(s);
             if (s.audioBase64) {
                 const bin = atob(s.audioBase64); const bytes = new Uint8Array(bin.length);
                 for (let k = 0; k < bin.length; k++) bytes[k] = bin.charCodeAt(k);
@@ -5488,10 +7024,21 @@ export default function VideoEditor() {
             const b64 = new TextDecoder('latin1').decode(buf.slice(dataStart, dataEnd)).trim();
             const snapshot = JSON.parse(decodeURIComponent(escape(atob(b64))));
             if (!snapshot.slides || !snapshot.slides.length) throw new Error('Вшиті дані проєкту порожні або пошкоджені.');
-            dispatchVideo({ type: 'SET_SLIDES', slides: snapshot.slides });
-            setSelectedSlideId(snapshot.slides[0]?.id || null);
+            // Оживляємо медіа: data:-URL -> blob:-URL; мертві blob: зі старих експортів -> попередження
+            const { slides: revivedSlides, deadMedia } = reviveEmbeddedSlides(snapshot.slides);
+            dispatchVideo({ type: 'SET_SLIDES', slides: revivedSlides });
+            setSelectedSlideId(revivedSlides[0]?.id || null);
             setSelectedObjectId(null);
-            logChange('Імпорт', `Відкрито відео для редагування: "${file.name}"`, { slides: snapshot.slides.length });
+            if (deadMedia > 0) {
+                toast('error', `Не вдалося відновити ${deadMedia} відео/аудіо: файл експортовано старішою версією редактора. Переекспортуйте проєкт із поточної версії.`, { duration: 9000 });
+            }
+            // Прогріваємо відновлені відео, щоб прев'ю та експорт стартували миттєво
+            const revivedSrcs = new Set();
+            for (const s of revivedSlides) for (const o of (s.objects || [])) {
+                if ((o.type === 'video' || o.type === 'audio') && o.src) revivedSrcs.add(o.src);
+            }
+            (async () => { for (const src of Array.from(revivedSrcs)) { try { await loadVideo(src); } catch (e) { /* ignore */ } } })();
+            logChange('Імпорт', `Відкрито відео для редагування: "${file.name}"`, { slides: revivedSlides.length, deadMedia });
         } catch (err) {
             setFileError('Зворотна конвертація: ' + err.message);
             logChange('Помилка', 'Не вдалося відкрити відео для редагування', err.message);
@@ -5504,6 +7051,7 @@ export default function VideoEditor() {
     // .mp4/.webm (експортований цим редактором) → відновлення проєкту.
     const handleIncomingFile = (file) => {
         if (!file) return;
+        if (/\.atmo$/i.test(file.name || '')) { openProjectFile(file); return; } // U-05
         const isVideoFile = /\.(mp4|webm)$/i.test(file.name || '') || /^video\//.test(file.type || '');
         if (isVideoFile) importVideoProject(file);
         else processPPTXFile(file);
@@ -5533,6 +7081,7 @@ export default function VideoEditor() {
         if (obj.type === 'video') return 'Відео';
         if (obj.type === 'table') return 'Таблиця';
         if (obj.type === 'math') return 'Формула';
+        if (obj.type === 'ticker') return 'Бігучий рядок';
         if (obj.type === 'interactive') return (H5P_TYPES.find(t => t[0] === obj.iType) || [null, 'Інтерактив'])[1];
         return `Фігура (${obj.shapeKind})`;
     };
@@ -5612,6 +7161,24 @@ export default function VideoEditor() {
                 );
             }
             return videoEl({ width: '100%', height: '100%', objectFit: 'contain', borderRadius: radius || undefined });
+        }
+
+        if (obj.type === 'ticker') {
+            return (
+                <div
+                    className="w-full h-full flex items-center overflow-hidden"
+                    style={{
+                        backgroundColor: obj.fillColor || 'rgba(15, 23, 42, 0.85)',
+                        color: obj.color || '#fff',
+                        fontWeight: 700,
+                        fontSize: Math.max((obj.fontSize || 32) * scale, 8),
+                        whiteSpace: 'nowrap'
+                    }}
+                    title={`Бігучий рядок: з'явиться за ${obj.startBeforeEnd != null ? obj.startBeforeEnd : 5}с до кінця озвучки`}
+                >
+                    <span style={{ paddingLeft: 12 }}>🏃 {obj.text || 'Бігучий рядок'}</span>
+                </div>
+            );
         }
 
         if (obj.type === 'math') {
@@ -5907,11 +7474,37 @@ export default function VideoEditor() {
                                 <input
                                     type="number"
                                     value={Math.round(obj[key])}
-                                    onChange={(e) => updateObj({ [key]: parseInt(e.target.value, 10) || 0 })}
+                                    onChange={(e) => {
+                                        const val = parseInt(e.target.value, 10) || 0;
+                                        // U-56: замок пропорцій — W і H змінюються разом
+                                        if (obj.aspectLocked && (key === 'w' || key === 'h') && obj.w > 0 && obj.h > 0) {
+                                            const ratio = obj.w / obj.h;
+                                            updateObj(key === 'w'
+                                                ? { w: val, h: Math.max(4, Math.round(val / ratio)) }
+                                                : { h: val, w: Math.max(4, Math.round(val * ratio)) });
+                                        } else updateObj({ [key]: val });
+                                    }}
                                     className="w-full px-1.5 py-1 text-xs border border-slate-200 rounded-lg outline-none focus:border-indigo-400 bg-white"
                                 />
                             </label>
                         ))}
+                    </div>
+                    {/* U-56 замок пропорцій + U-53 закріплення об'єкта */}
+                    <div className="grid grid-cols-2 gap-2">
+                        <button
+                            onClick={() => updateObj({ aspectLocked: !obj.aspectLocked })}
+                            className={`px-2 py-1.5 rounded-lg text-[11px] font-bold border transition-colors flex items-center justify-center gap-1 ${obj.aspectLocked ? 'bg-violet-50 border-violet-300 text-[#7c3aed]' : 'bg-white border-slate-200 text-slate-500 hover:bg-slate-50'}`}
+                            title="Пропорції W:H змінюються разом"
+                        >
+                            {obj.aspectLocked ? <Lock size={11} /> : <Unlock size={11} />} Пропорції
+                        </button>
+                        <button
+                            onClick={() => { updateObj({ locked: !obj.locked }); toast('info', obj.locked ? 'Об\'єкт розблоковано' : 'Об\'єкт закріплено — переміщення вимкнено'); }}
+                            className={`px-2 py-1.5 rounded-lg text-[11px] font-bold border transition-colors flex items-center justify-center gap-1 ${obj.locked ? 'bg-amber-50 border-amber-300 text-amber-600' : 'bg-white border-slate-200 text-slate-500 hover:bg-slate-50'}`}
+                            title="Закріплений об'єкт не рухається мишею (захист від випадкових зсувів)"
+                        >
+                            {obj.locked ? <Lock size={11} /> : <Unlock size={11} />} {obj.locked ? 'Закріплено' : 'Закріпити'}
+                        </button>
                     </div>
 
                     {/* Прозорість блоку */}
@@ -5988,6 +7581,45 @@ export default function VideoEditor() {
                             <span className="text-[10px] text-slate-400 block">
                                 Видима частина розтягується на весь блок (як у PowerPoint)
                             </span>
+                        </div>
+                    )}
+
+                    {/* Налаштування бігучого рядка */}
+                    {obj.type === 'ticker' && (
+                        <div className="space-y-2 border-t border-[#F0EEE6] pt-3">
+                            <span className="text-[10px] font-bold text-slate-400 uppercase">🏃 Бігучий рядок</span>
+                            <textarea
+                                value={obj.text || ''}
+                                onChange={(e) => updateObj({ text: e.target.value })}
+                                placeholder="Текст, що пролетить стрічкою"
+                                className="w-full min-h-[56px] p-2 text-xs border border-slate-200 rounded-lg outline-none focus:border-indigo-400 resize-y bg-white"
+                            />
+                            <label className="flex items-center gap-2 text-[11px] font-semibold text-slate-500">
+                                З'явитись за
+                                <input
+                                    type="number" step="0.5" min="1" max="60"
+                                    value={obj.startBeforeEnd != null ? obj.startBeforeEnd : 5}
+                                    onChange={(e) => updateObj({ startBeforeEnd: Math.max(1, Math.min(parseFloat(e.target.value) || 5, 60)) })}
+                                    className="w-16 px-1.5 py-1 text-xs border border-slate-200 rounded-lg outline-none focus:border-indigo-400 bg-white"
+                                    title="За скільки секунд до КІНЦЯ озвучки слайда з'явиться стрічка; за цей самий час текст повністю пролетить"
+                                />
+                                <span className="text-slate-300 text-[10px]">с до кінця озвучки</span>
+                            </label>
+                            <div className="grid grid-cols-3 gap-2">
+                                <label className="flex flex-col gap-0.5 text-[10px] font-bold text-slate-400">
+                                    Текст
+                                    <input type="color" value={obj.color || '#ffffff'} onChange={(e) => updateObj({ color: e.target.value })} className="w-full h-7 border border-slate-200 rounded cursor-pointer" />
+                                </label>
+                                <label className="flex flex-col gap-0.5 text-[10px] font-bold text-slate-400">
+                                    Стрічка
+                                    <input type="color" value={/^#/.test(obj.fillColor || '') ? obj.fillColor : '#0f172a'} onChange={(e) => updateObj({ fillColor: e.target.value })} className="w-full h-7 border border-slate-200 rounded cursor-pointer" />
+                                </label>
+                                <label className="flex flex-col gap-0.5 text-[10px] font-bold text-slate-400">
+                                    Кегль
+                                    <input type="number" min="14" max="72" value={obj.fontSize || 32} onChange={(e) => updateObj({ fontSize: Math.max(14, Math.min(parseInt(e.target.value, 10) || 32, 72)) })} className="w-full px-1.5 py-1 text-xs border border-slate-200 rounded-lg outline-none focus:border-indigo-400 bg-white" />
+                                </label>
+                            </div>
+                            <p className="text-[9px] text-slate-400">Стрічка видима лише у прев'ю та готовому відео — час появи рахується від тривалості озвучки слайда.</p>
                         </div>
                     )}
 
@@ -6070,8 +7702,23 @@ export default function VideoEditor() {
                                                 className="flex-1 px-1.5 py-1 text-xs border border-slate-200 rounded-lg outline-none focus:border-indigo-400 bg-white"
                                             >
                                                 <option value="">(тема)</option>
-                                                {fontList.map(f => <option key={f} value={f}>{f}</option>)}
+                                                {fontList.map(f => <option key={f} value={f} style={{ fontFamily: f }}>{f}</option>)}
                                             </select>
+                                        </label>
+                                        {/* U-101: міжрядковий інтервал — лікує «великі пробіли між написами» */}
+                                        <label className="flex items-center gap-2 text-[11px] font-semibold text-slate-500">
+                                            Інтервал
+                                            <input
+                                                type="number" step="0.05" min="0.7" max="3"
+                                                value={obj.lines?.[0]?.lineSpacing || 1}
+                                                onChange={(e) => {
+                                                    const v = Math.min(3, Math.max(0.7, parseFloat(e.target.value) || 1));
+                                                    updateObj({ lines: (obj.lines || []).map(l => ({ ...l, lineSpacing: v })) });
+                                                }}
+                                                title="Міжрядковий інтервал (1 = звичайний)"
+                                                className="w-16 px-1.5 py-1 text-xs border border-slate-200 rounded-lg outline-none focus:border-indigo-400 bg-white"
+                                            />
+                                            <span className="text-slate-300 text-[10px]">× висоти рядка</span>
                                         </label>
                                     </>
                                 );
@@ -6211,6 +7858,54 @@ export default function VideoEditor() {
                             </div>
                         )}
                     </div>
+
+                    {/* U-109: Анімація зникнення (exit) — критично для накладання шарів */}
+                    <div className="space-y-2 border-t border-[#F0EEE6] pt-3">
+                        <span className="text-[10px] font-bold text-slate-400 uppercase flex items-center gap-1">
+                            <Sparkles size={11} /> Анімація зникнення
+                        </span>
+                        <select
+                            value={obj.exitAnimation?.type || 'none'}
+                            onChange={(e) => {
+                                const type = e.target.value;
+                                updateObj({
+                                    exitAnimation: type === 'none' ? null : {
+                                        type,
+                                        at: obj.exitAnimation?.at != null ? obj.exitAnimation.at : Math.max((anim.delay || 0) + (anim.duration || 0.5) + 2, 3),
+                                        duration: obj.exitAnimation?.duration || 0.6
+                                    }
+                                });
+                                logChange('Анімація', `Зникнення об'єкта → ${EXIT_ANIMATIONS[type] || type}`, { slideId: slide.id, objectId: obj.id });
+                            }}
+                            className="w-full px-2 py-1.5 text-xs border border-slate-200 rounded-lg outline-none focus:border-indigo-400 bg-white"
+                        >
+                            {Object.entries(EXIT_ANIMATIONS).map(([k, label]) => (
+                                <option key={k} value={k}>{label}</option>
+                            ))}
+                        </select>
+                        {obj.exitAnimation && obj.exitAnimation.type !== 'none' && (
+                            <div className="grid grid-cols-2 gap-2">
+                                <label className="flex flex-col gap-0.5">
+                                    <span className="text-[10px] font-bold text-slate-400">Зникнути о (с)</span>
+                                    <input
+                                        type="number" step="0.1" min="0"
+                                        value={obj.exitAnimation.at}
+                                        onChange={(e) => updateObj({ exitAnimation: { ...obj.exitAnimation, at: Math.max(0, parseFloat(e.target.value) || 0) } })}
+                                        className="w-full px-1.5 py-1 text-xs border border-slate-200 rounded-lg outline-none focus:border-indigo-400 bg-white"
+                                    />
+                                </label>
+                                <label className="flex flex-col gap-0.5">
+                                    <span className="text-[10px] font-bold text-slate-400">Тривалість (с)</span>
+                                    <input
+                                        type="number" step="0.1" min="0.2"
+                                        value={obj.exitAnimation.duration}
+                                        onChange={(e) => updateObj({ exitAnimation: { ...obj.exitAnimation, duration: Math.max(0.2, parseFloat(e.target.value) || 0.2) } })}
+                                        className="w-full px-1.5 py-1 text-xs border border-slate-200 rounded-lg outline-none focus:border-indigo-400 bg-white"
+                                    />
+                                </label>
+                            </div>
+                        )}
+                    </div>
                 </div>
             );
         }
@@ -6237,6 +7932,31 @@ export default function VideoEditor() {
                         ))}
                     </select>
                 </label>
+                {/* Тривалість переходу — власне значення на слайд (0.1–5с) */}
+                {(TRANSITIONS[slide.transition]?.duration || 0) > 0 && (
+                    <label className="flex items-center gap-2 text-[11px] font-semibold text-slate-500">
+                        Тривалість переходу
+                        <input
+                            type="number" step="0.1" min="0.1" max="5"
+                            value={slide.transitionDuration != null ? slide.transitionDuration : (TRANSITIONS[slide.transition]?.duration || 0.8)}
+                            onChange={(e) => {
+                                const v = Math.max(0.1, Math.min(parseFloat(e.target.value) || 0.8, 5));
+                                dispatchVideo({ type: 'UPDATE_SLIDE', slideId: slide.id, updates: { transitionDuration: v } });
+                                logChange('Перехід', `Слайд ${slide.slideNumber}: тривалість переходу → ${v}с`);
+                            }}
+                            className="w-16 px-1.5 py-1 text-xs border border-slate-200 rounded-lg outline-none focus:border-[#16a34a] bg-white"
+                            title="Скільки секунд триває ефект переходу до цього слайда (0.1–5с)"
+                        />
+                        <span className="text-slate-300 text-[10px]">сек</span>
+                        {slide.transitionDuration != null && (
+                            <button
+                                onClick={() => dispatchVideo({ type: 'UPDATE_SLIDE', slideId: slide.id, updates: { transitionDuration: null } })}
+                                className="text-[10px] font-bold text-slate-400 hover:text-[#16a34a] underline"
+                                title="Повернути типову тривалість ефекту"
+                            >типова</button>
+                        )}
+                    </label>
+                )}
 
                 {/* Швидкі пресети анімацій (без AI) */}
                 <div className="space-y-1.5">
@@ -6272,6 +7992,29 @@ export default function VideoEditor() {
                             По диктору
                         </button>
                     </div>
+                    {/* U-108: вимкнути всі анімації слайда (дефолтні плашки теж) одним кліком */}
+                    <button
+                        onClick={() => {
+                            dispatchVideo({ type: 'CLEAR_SLIDE_ANIMATIONS', slideId: slide.id });
+                            toast('info', `Слайд ${slide.slideNumber}: анімації вимкнено`, {
+                                action: { label: 'Повернути', onClick: () => dispatchVideo({ type: 'UNDO' }) }
+                            });
+                            logChange('Анімація', `Слайд ${slide.slideNumber}: усі анімації вимкнено`);
+                        }}
+                        disabled={slide.objects.length === 0}
+                        className="w-full px-2 py-1.5 bg-slate-50 text-slate-500 hover:bg-slate-100 disabled:opacity-40 rounded-xl text-[11px] font-bold transition-colors"
+                        title="Прибрати анімації появи та зникнення з УСІХ об'єктів слайда — все видно одразу"
+                    >
+                        ∅ Без анімацій (весь слайд)
+                    </button>
+                    {/* Бігучий рядок — титри, що пролітають наприкінці слайда */}
+                    <button
+                        onClick={addTicker}
+                        className="w-full px-2 py-1.5 bg-slate-50 text-slate-600 hover:bg-violet-50 hover:text-[#7c3aed] rounded-xl text-[11px] font-bold transition-colors"
+                        title="Стрічка тексту, що з'являється за N секунд до кінця озвучки і пролітає справа наліво (типово — для останнього слайда)"
+                    >
+                        🏃 Додати бігучий рядок
+                    </button>
                 </div>
 
                 {/* Перегенерація розподілу анімацій цього слайду через AI */}
@@ -6434,9 +8177,138 @@ export default function VideoEditor() {
                 <span className="text-sm font-bold text-[#3D3D3A]">AI Video Studio</span>
             </div>
 
+            {/* ── UXKit: глобальні оверлеї (U-18 тости, U-19 прогрес імпорту, U-72 клавіші) ── */}
+            <ToastHost />
+            <ImportProgressOverlay progress={importProgress} />
+            <ShortcutsModal open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
+            <PronunciationDictModal
+                open={pronDictOpen}
+                onClose={() => setPronDictOpen(false)}
+                dict={pronDict}
+                onChange={updatePronDict}
+            />
+            {/* U-14: тур для новачків — 4 кроки при першому вході в редактор */}
+            {tourStep != null && (() => {
+                const steps = [
+                    { icon: '🎬', title: 'Сцени зліва', text: 'Кожен слайд — окрема сцена. Клік — обрати, перетягнути — змінити порядок, значки показують озвучку/відео/помилки.' },
+                    { icon: '🖱️', title: 'Канвас у центрі', text: 'Подвійний клік по тексту — редагувати на місці. Тягніть по порожньому — рамкове виділення. ПКМ — меню. Стрілки — точний зсув.' },
+                    { icon: '🎙️', title: 'Озвучка знизу', text: 'Напишіть текст диктора — українські речення озвучаться українським голосом, англійські — британським. «▶ Зразок» — почути голос, «Вимова» — наголоси термінів.' },
+                    { icon: '📥', title: 'Експорт', text: 'Кнопка «Завантажити»: MP4 1080p/H.264/30fps зі звуком. Чекліст покаже, чи всі слайди озвучені. Проєкт автозберігається — нічого не загубиться.' }
+                ];
+                const st = steps[tourStep];
+                const finish = () => { localStorage.setItem('atmo-tour-done', '1'); setTourStep(null); };
+                return (
+                    <div className="fixed inset-0 z-[92] flex items-center justify-center" role="dialog" aria-modal="true" aria-label="Знайомство з редактором">
+                        <div className="absolute inset-0 bg-black/50" onClick={finish} />
+                        <div className="relative bg-white rounded-2xl shadow-2xl w-[420px] max-w-[92vw] p-6 text-center space-y-3">
+                            <div className="text-4xl" aria-hidden="true">{st.icon}</div>
+                            <h2 className="text-base font-bold text-slate-800">{st.title}</h2>
+                            <p className="text-xs text-slate-500 leading-relaxed">{st.text}</p>
+                            <div className="flex items-center justify-center gap-1.5 py-1">
+                                {steps.map((_, i) => (
+                                    <span key={i} className={`w-2 h-2 rounded-full ${i === tourStep ? 'bg-[#7c3aed]' : 'bg-slate-200'}`} />
+                                ))}
+                            </div>
+                            <div className="flex items-center justify-center gap-2">
+                                <button onClick={finish} className="px-4 py-2 rounded-lg text-xs font-semibold text-slate-500 hover:bg-slate-100">Пропустити</button>
+                                <button
+                                    onClick={() => (tourStep + 1 < steps.length ? setTourStep(tourStep + 1) : finish())}
+                                    className="px-5 py-2 rounded-lg text-xs font-bold text-white bg-[#7c3aed] hover:bg-[#6d28d9]"
+                                >{tourStep + 1 < steps.length ? 'Далі →' : 'Почати роботу'}</button>
+                            </div>
+                        </div>
+                    </div>
+                );
+            })()}
+            {/* U-111: довідка «Вимоги та поради» */}
+            {helpOpen && (
+                <div className="fixed inset-0 z-[90] flex items-center justify-center" role="dialog" aria-modal="true" aria-label="Довідка">
+                    <div className="absolute inset-0 bg-black/40" onClick={() => setHelpOpen(false)} />
+                    <div className="relative bg-white rounded-2xl shadow-2xl w-[560px] max-w-[94vw] max-h-[84vh] overflow-y-auto p-6 text-xs text-slate-600 leading-relaxed space-y-3">
+                        <div className="flex items-center justify-between">
+                            <h2 className="text-sm font-bold text-slate-800">Вимоги та поради</h2>
+                            <button onClick={() => setHelpOpen(false)} aria-label="Закрити" className="text-slate-400 hover:text-slate-600 p-1">✕</button>
+                        </div>
+                        <div>
+                            <h3 className="font-bold text-slate-700 mb-1">📄 Формати файлів</h3>
+                            <p><strong>Презентації:</strong> .pptx (старий .ppt збережіть у PowerPoint як .pptx). <strong>Зображення:</strong> PNG, JPEG, GIF, BMP, WebP, SVG, ICO, TIFF, AVIF, HEIC — визначаються автоматично; векторні EMF/WMF браузер не декодує (буде плейсхолдер). <strong>Відео:</strong> MP4 (H.264) — найкраще; MOV/WebM теж працюють. <strong>Проєкт:</strong> .atmo або експортований MP4 — обидва відкриваються назад у редакторі.</p>
+                        </div>
+                        <div>
+                            <h3 className="font-bold text-slate-700 mb-1">🎨 Редактор</h3>
+                            <p>Подвійний клік по тексту — редагування на місці. Перетягніть по порожньому місцю — рамкове виділення; Shift+клік — додати до виділення; у панелі з'являться «Вирівняти» та «Розподілити». ПКМ по об'єкту — меню (шари, закріплення, дублювання). Слайди зліва переставляються перетягуванням. Всі гарячі клавіші — кнопка «?».</p>
+                        </div>
+                        <div>
+                            <h3 className="font-bold text-slate-700 mb-1">🎙️ Озвучка</h3>
+                            <p>Українські речення читаються українським голосом, англійські — британською англійською (автоматично). Складні терміни й наголоси задайте у «Вимова» — на слайдах текст не зміниться. «▶ Зразок» — прослухати голос до генерації. Якщо звук зник — кнопка з навушниками в топбарі перезапустить аудіо без перезавантаження.</p>
+                        </div>
+                        <div>
+                            <h3 className="font-bold text-slate-700 mb-1">🎬 Анімації та відео</h3>
+                            <p>Кожен об'єкт має появу та зникнення (exit) — керуйте в панелі об'єкта. «Без анімацій (весь слайд)» — вимикає все одним кліком. Коротке відео на довгому слайді типово зациклюється; режим (loop/розтягнути/обрізати) — в панелі відео. Великі презентації (150МБ+) імпортуються довше — не закривайте вкладку, прогрес видно на екрані.</p>
+                        </div>
+                        <div>
+                            <h3 className="font-bold text-slate-700 mb-1">💾 Збереження</h3>
+                            <p>Проєкт автозберігається у браузері кожні ~3 секунди (статус у топбарі) і пропонується до відновлення при наступному вході. Ctrl+S — зберегти у файл .atmo. Експортований MP4 містить проєкт усередині — його можна відкрити й доредагувати.</p>
+                        </div>
+                    </div>
+                </div>
+            )}
+            {/* U-79/U-85: видимий фокус для клавіатури + повага до reduced-motion */}
+            <style>{`
+                :focus-visible { outline: 2px solid #7c3aed; outline-offset: 2px; }
+                @media (prefers-reduced-motion: reduce) {
+                    *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+                }
+            `}</style>
+            {/* U-42: контекстне меню об'єкта (ПКМ) */}
+            {ctxMenu && (() => {
+                const cSlide = slides.find(sl => sl.id === selectedSlideId);
+                const cObj = cSlide && cSlide.objects.find(o => o.id === ctxMenu.objId);
+                if (!cSlide || !cObj) return null;
+                const item = (label, fn, danger) => (
+                    <button
+                        key={label}
+                        onClick={() => { setCtxMenu(null); fn(); }}
+                        className={`w-full text-left px-3 py-1.5 hover:bg-violet-50 ${danger ? 'text-red-600 hover:bg-red-50' : 'text-slate-700'}`}
+                    >{label}</button>
+                );
+                return (
+                    <>
+                        <div className="fixed inset-0 z-[110]" onClick={() => setCtxMenu(null)} onContextMenu={(e) => { e.preventDefault(); setCtxMenu(null); }} />
+                        <div
+                            className="fixed z-[111] bg-white rounded-xl shadow-2xl border border-slate-200 py-1 w-52 text-xs font-semibold"
+                            style={{ left: Math.min(ctxMenu.x, window.innerWidth - 220), top: Math.min(ctxMenu.y, window.innerHeight - 230) }}
+                        >
+                            {item('Дублювати  (Ctrl+D)', () => {
+                                const newId = 'obj_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
+                                dispatchVideo({ type: 'DUPLICATE_OBJECT', slideId: cSlide.id, objectId: cObj.id, newId });
+                                setSelectedObjectId(newId);
+                            })}
+                            {item('Шар вище  ↑', () => dispatchVideo({ type: 'REORDER_OBJECT', slideId: cSlide.id, objectId: cObj.id, direction: 'up' }))}
+                            {item('Шар нижче  ↓', () => dispatchVideo({ type: 'REORDER_OBJECT', slideId: cSlide.id, objectId: cObj.id, direction: 'down' }))}
+                            {item(cObj.locked ? 'Відкріпити' : 'Закріпити (без руху)', () =>
+                                dispatchVideo({ type: 'UPDATE_OBJECT', slideId: cSlide.id, objectId: cObj.id, updates: { locked: !cObj.locked } }))}
+                            {item('Видалити  (Del)', () => {
+                                dispatchVideo({ type: 'DELETE_OBJECTS', slideId: cSlide.id, objectIds: [cObj.id] });
+                                setSelectedObjectId(null);
+                                toast('info', 'Об\'єкт видалено', { action: { label: 'Повернути', onClick: () => dispatchVideo({ type: 'UNDO' }) } });
+                            }, true)}
+                        </div>
+                    </>
+                );
+            })()}
+
             {slides.length === 0 ? (
                 /* ===== ЕКРАН ЗАВАНТАЖЕННЯ PPTX ===== */
-                <div className="flex-1 flex items-center justify-center p-8">
+                <div className="flex-1 flex flex-col items-center justify-center p-8">
+                    {/* U-02: пропозиція відновити автозбережену сесію */}
+                    {restoreSnapshot && (
+                        <RestoreBanner
+                            savedAt={restoreSnapshot.savedAt}
+                            slidesCount={restoreSnapshot.slides.length}
+                            onRestore={restoreSession}
+                            onDismiss={dismissRestore}
+                        />
+                    )}
                     <div
                         className={`w-full max-w-xl bg-white rounded-3xl shadow-lg transition-all overflow-hidden relative ${isDragging ? 'border-2 border-[#7c3aed] bg-purple-50/30' : 'border border-slate-200'}`}
                         onDrop={handleDrop}
@@ -6484,21 +8356,49 @@ export default function VideoEditor() {
                                     }} className="hidden" />
                                 </label>
                             </div>
-                            <button
-                                onClick={addBlankSlide}
-                                className="text-sm font-semibold text-slate-400 hover:text-[#7c3aed] underline underline-offset-2 transition-colors"
-                            >
-                                або почати з порожнього слайду
-                            </button>
+                            <div className="flex items-center gap-4">
+                                <button
+                                    onClick={addBlankSlide}
+                                    className="text-sm font-semibold text-slate-400 hover:text-[#7c3aed] underline underline-offset-2 transition-colors"
+                                >
+                                    почати з порожнього слайду
+                                </button>
+                                <span className="text-slate-300">·</span>
+                                <button
+                                    onClick={startDemoProject}
+                                    className="text-sm font-semibold text-[#7c3aed] hover:text-[#6d28d9] underline underline-offset-2 transition-colors"
+                                    title="2 готові слайди з формулою та анімаціями — щоб спробувати без свого файлу"
+                                >
+                                    ✨ спробувати на демо
+                                </button>
+                            </div>
                         </div>
                     </div>
                 </div>
             ) : (
-                /* ===== ОСНОВНИЙ РЕДАКТОР (Synthesia layout) ===== */
+                /* ===== ОСНОВНИЙ РЕДАКТОР (Synthesia layout) =====
+                   U-110: error boundary — збій рендера показує картку відновлення
+                   замість «білого екрана»; key за слайдом, тож перемикання сцени
+                   у списку зліва теж скидає помилку */
+                <UIErrorBoundary
+                    key={selectedSlideId || 'editor'}
+                    label="редактор"
+                    onUndo={() => dispatchVideo({ type: 'UNDO' })}
+                    onError={(err) => logChange('Помилка', 'Збій рендера редактора (перехоплено)', err?.message)}
+                >
                 <div className="flex-1 flex overflow-hidden">
 
-                    {/* ── ЛІВА ПАНЕЛЬ: сцени ── */}
-                    <div className="w-[154px] flex-shrink-0 bg-white border-r border-slate-200 flex flex-col">
+                    {/* ── ЛІВА ПАНЕЛЬ: сцени (U-33: згортається для більшого канваса) ── */}
+                    <div className={`${scenesCollapsed ? 'w-7' : 'w-[154px]'} flex-shrink-0 bg-white border-r border-slate-200 flex flex-col transition-all`}>
+                        <button
+                            onClick={() => setScenesCollapsed(c => !c)}
+                            aria-label={scenesCollapsed ? 'Розгорнути панель сцен' : 'Згорнути панель сцен'}
+                            title={scenesCollapsed ? 'Розгорнути сцени' : 'Згорнути сцени'}
+                            className="h-6 flex items-center justify-center text-slate-400 hover:text-[#7c3aed] hover:bg-slate-50"
+                        >
+                            {scenesCollapsed ? '»' : '«'}
+                        </button>
+                        {!scenesCollapsed && <>
                         <button
                             onClick={() => {
                                 const fileIn = document.createElement('input');
@@ -6523,6 +8423,14 @@ export default function VideoEditor() {
                             <Film size={13} /> Імпорт з відео
                         </button>
                         <button
+                            onClick={saveProjectToFile}
+                            disabled={slides.length === 0}
+                            className="mx-2 mb-2 px-3 py-2 text-xs font-semibold text-slate-600 bg-slate-100 hover:bg-slate-200 disabled:opacity-40 rounded-lg transition-colors flex items-center justify-center gap-1.5"
+                            title="Зберегти проєкт у файл .atmo — відкривається перетягуванням на стартовий екран (Ctrl+S)"
+                        >
+                            <Download size={13} /> Зберегти .atmo
+                        </button>
+                        <button
                             onClick={addBlankSlide}
                             className="mx-2 mb-2 px-3 py-2 text-xs font-semibold text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors flex items-center justify-center gap-1.5"
                             title="Додати порожній слайд"
@@ -6533,7 +8441,15 @@ export default function VideoEditor() {
                             {slides.map((sl, idx) => {
                                 const isActive = sl.id === selectedSlideId;
                                 return (
-                                    <div key={sl.id} className="relative group/slide">
+                                    <div
+                                        key={sl.id}
+                                        className="relative group/slide"
+                                        draggable
+                                        onDragStart={(e) => { slideDragIdxRef.current = idx; e.dataTransfer.effectAllowed = 'move'; }}
+                                        onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; }}
+                                        onDrop={(e) => { e.preventDefault(); reorderSlides(slideDragIdxRef.current, idx); slideDragIdxRef.current = null; }}
+                                        title="Перетягніть, щоб змінити порядок слайдів"
+                                    >
                                         {idx > 0 && (
                                             <div className="flex items-center justify-center gap-1 py-0.5" title="Перехід від попереднього слайда">
                                                 <Zap size={9} className="text-slate-300 flex-shrink-0" />
@@ -6563,9 +8479,22 @@ export default function VideoEditor() {
                                                 <span className={`absolute top-1 left-1 text-[9px] font-bold px-1 rounded ${isActive ? 'bg-[#7c3aed] text-white' : 'bg-black/40 text-white'}`}>
                                                     {idx + 1}
                                                 </span>
+                                                {/* U-30: статуси слайда — озвучка / відео / помилка / тривалість */}
                                                 {sl.audioBase64 && (
-                                                    <CheckCircle size={10} className="absolute top-1 right-1 text-emerald-400 drop-shadow" />
+                                                    <CheckCircle size={10} className="absolute top-1 right-1 text-emerald-400 drop-shadow" title="Озвучено" />
                                                 )}
+                                                {sl.isGenerating && (
+                                                    <Loader2 size={10} className="absolute top-1 right-1 text-violet-500 animate-spin drop-shadow" title="Озвучується…" />
+                                                )}
+                                                {sl.objects.some(o => o.type === 'video') && (
+                                                    <Video size={10} className="absolute top-1 right-4 text-sky-400 drop-shadow" title="Містить відео" />
+                                                )}
+                                                {sl.error && (
+                                                    <AlertCircle size={10} className="absolute bottom-1 left-1 text-red-500 drop-shadow" title={sl.error} />
+                                                )}
+                                                <span className="absolute bottom-0.5 right-1 text-[7px] font-bold text-white bg-black/40 px-0.5 rounded" title="Тривалість сцени">
+                                                    {formatDuration(getSlideDuration(sl))}
+                                                </span>
                                                 {sl.objects.map((o, oi) => (
                                                     <div key={o.id} className="absolute overflow-hidden" style={{
                                                         left: `${(o.x / CANVAS_W) * 100}%`,
@@ -6575,9 +8504,9 @@ export default function VideoEditor() {
                                                         opacity: o.opacity != null ? o.opacity : 1,
                                                         zIndex: oi + 1
                                                     }}>
-                                                        {o.type === 'image' && <img src={o.src} alt="" className="w-full h-full object-fill" draggable={false} />}
+                                                        {o.type === 'image' && <img src={o.src} alt="" loading="lazy" decoding="async" className="w-full h-full object-fill" draggable={false} />}
                                                         {o.type === 'video' && (o.poster
-                                                            ? <img src={o.poster} alt="" className="w-full h-full object-fill" draggable={false} />
+                                                            ? <img src={o.poster} alt="" loading="lazy" decoding="async" className="w-full h-full object-fill" draggable={false} />
                                                             : <div className="w-full h-full bg-slate-800" />)}
                                                         {o.type === 'math' && (
                                                             <div className="w-full h-full overflow-hidden" style={{ fontSize: 3, color: '#111' }} dangerouslySetInnerHTML={{ __html: o.mathml || '' }} />
@@ -6622,6 +8551,7 @@ export default function VideoEditor() {
                                 );
                             })}
                         </div>
+                        </>}
                     </div>
 
                     {/* ── ЦЕНТРАЛЬНА ОБЛАСТЬ ── */}
@@ -6643,6 +8573,33 @@ export default function VideoEditor() {
                                 ))}
                             </div>
                             <div className="flex items-center gap-2">
+                                {/* U-04: стан автозбереження */}
+                                <AutosaveIndicator status={autosave.status} savedAt={autosave.savedAt} />
+                                {/* U-105: якщо звук зник — перезапуск аудіорушія без перезавантаження сторінки */}
+                                <button
+                                    onClick={() => { restartAudioEngine(); toast('success', 'Звуковий рушій перезапущено'); }}
+                                    aria-label="Перезапустити звук"
+                                    title="Перезапустити звук (якщо озвучка перестала грати)"
+                                    className="p-1.5 rounded text-slate-400 hover:text-[#7c3aed] hover:bg-slate-100 transition-colors"
+                                >
+                                    <Headphones size={14} />
+                                </button>
+                                {/* U-111: довідка «Вимоги та поради» */}
+                                <button
+                                    onClick={() => setHelpOpen(true)}
+                                    aria-label="Довідка: вимоги та поради"
+                                    title="Вимоги до форматів і поради по роботі"
+                                    className="p-1.5 rounded text-slate-400 hover:text-[#7c3aed] hover:bg-slate-100 transition-colors"
+                                >
+                                    <FileText size={14} />
+                                </button>
+                                {/* U-72: довідка гарячих клавіш */}
+                                <button
+                                    onClick={() => setShortcutsOpen(true)}
+                                    aria-label="Гарячі клавіші"
+                                    title="Гарячі клавіші (?)"
+                                    className="w-6 h-6 rounded-full border border-slate-300 text-slate-500 hover:bg-slate-100 text-xs font-bold"
+                                >?</button>
                                 <div className="flex items-center gap-0.5 mr-1 border-r border-slate-200 pr-2">
                                     <button onClick={() => dispatchVideo({ type: 'UNDO' })} disabled={!canUndo} className="p-1.5 rounded text-slate-500 hover:bg-slate-100 disabled:opacity-30 transition-colors" title="Undo (Ctrl+Z)">
                                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="1 4 1 10 7 10" /><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10" /></svg>
@@ -6668,14 +8625,25 @@ export default function VideoEditor() {
                                         className="px-4 py-1.5 bg-[#7c3aed] hover:bg-[#6d28d9] disabled:bg-slate-300 text-white rounded-lg text-xs font-bold shadow-sm transition-all flex items-center gap-1.5"
                                     >
                                         {(isExporting || isExportingAudio) ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}
-                                        {isExporting ? `${exportProgress}%` : (isExportingAudio ? '...' : 'Завантажити')}
+                                        {isExporting ? `${exportProgress}%${exportEta ? ' · ' + exportEta : ''}` : (isExportingAudio ? '...' : 'Завантажити')}
                                         {!isExporting && !isExportingAudio && <ChevronDown size={12} />}
                                     </button>
                                     {exportMenuOpen && !isExporting && !isExportingAudio && (
                                         <>
                                             <div className="fixed inset-0 z-40" onClick={() => setExportMenuOpen(false)} />
                                             <div className="absolute right-0 mt-1 w-64 bg-white rounded-xl shadow-2xl border border-slate-200 z-50 overflow-hidden">
+                                                {/* U-70/U-71: готовність до експорту + тривалість майбутнього відео */}
+                                                <ExportReadiness
+                                                    slidesTotal={slides.length}
+                                                    unvoiced={slides.filter(s => s.text.trim() && !s.audioBase64).length}
+                                                    durationSec={slides.reduce((acc, s, i) => acc + getSlideDuration(s) + (i > 0 ? getTransitionDuration(s) : 0), 0)}
+                                                    isGenerating={isGeneratingAll}
+                                                    onGenerateMissing={generateAllMissingSlidesAudio}
+                                                />
                                                 <div className="px-3 py-1.5 text-[10px] font-bold text-slate-400 uppercase tracking-wide bg-slate-50">Відео · 1920×1080 · H.264 · 30 fps · ~9 Мбіт/с</div>
+                                                <button onClick={() => { setExportMenuOpen(false); handleExportVideoFast({ withAudio: true }); }} className="w-full text-left px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-violet-50 flex items-center gap-2" title="Кодування через WebCodecs: у рази швидше реального часу; якщо браузер не підтримує — автоматично звичайний експорт">
+                                                    <Zap size={14} className="text-amber-500" /> ⚡ MP4 швидкий (WebCodecs)
+                                                </button>
                                                 <button onClick={() => { setExportMenuOpen(false); handleExportVideo({ withAudio: true }); }} className="w-full text-left px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-violet-50 flex items-center gap-2"><Film size={14} className="text-[#7c3aed]" /> MP4 зі звуком</button>
                                                 <button onClick={() => { setExportMenuOpen(false); handleExportVideo({ withAudio: false }); }} className="w-full text-left px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-violet-50 flex items-center gap-2"><Film size={14} className="text-slate-400" /> MP4 без звуку</button>
                                                 <div className="px-3 py-1.5 text-[10px] font-bold text-slate-400 uppercase tracking-wide bg-slate-50 border-t border-slate-100">Лише аудіо (озвучка)</div>
@@ -6774,6 +8742,36 @@ export default function VideoEditor() {
                                                 {animPrompt.trim() ? 'Згенерувати' : 'Фейд усюди'}
                                             </button>
                                         </div>
+                                        {/* Однотипні анімації: 3 обрані типи на всю презентацію */}
+                                        <div className="flex items-center gap-2 flex-wrap mt-2 pt-2 border-t border-slate-100">
+                                            <span className="text-[11px] font-bold text-slate-500 whitespace-nowrap" title="Єдиний стиль: заголовки — тип 1, зображення/відео — тип 2, решта — тип 3, поява каскадом">
+                                                🎯 Однотипні (3 анімації):
+                                            </span>
+                                            {[['заголовки', 0], ['медіа', 1], ['решта', 2]].map(([role, i]) => (
+                                                <label key={i} className="flex items-center gap-1 text-[10px] font-semibold text-slate-400">
+                                                    {role}
+                                                    <select
+                                                        value={uniformTypes[i]}
+                                                        onChange={(e) => setUniformTypes(prev => prev.map((t, j) => (j === i ? e.target.value : t)))}
+                                                        className="text-[11px] font-semibold text-slate-700 border border-slate-200 rounded-lg px-1.5 py-1 outline-none focus:border-[#7c3aed] bg-white max-w-[130px]"
+                                                    >
+                                                        {ANIMATION_OPTION_GROUPS.map(g => (
+                                                            <optgroup key={g.label} label={g.label}>
+                                                                {g.items.filter(([v]) => v !== 'none').map(([val, lbl]) => <option key={val} value={val}>{lbl}</option>)}
+                                                            </optgroup>
+                                                        ))}
+                                                    </select>
+                                                </label>
+                                            ))}
+                                            <button
+                                                onClick={applyUniformAnimations}
+                                                disabled={slides.length === 0}
+                                                className="px-3 py-1.5 bg-emerald-50 text-emerald-700 hover:bg-emerald-100 disabled:opacity-40 rounded-lg text-xs font-bold transition-colors whitespace-nowrap"
+                                                title="Анімувати ВСІ слайди лише цими трьома типами (тексти диктора й озвучка не змінюються)"
+                                            >
+                                                Анімувати всі
+                                            </button>
+                                        </div>
                                     </div>
                                 )}
                                 {videoToolTab === 'media' && vSlide && (
@@ -6853,6 +8851,7 @@ export default function VideoEditor() {
                                 <div className="relative w-full h-full flex items-center justify-center">
                                     <div
                                         ref={workspaceRef}
+                                        onMouseDown={(e) => { if (e.target === e.currentTarget && !interactiveMode) startMarquee(e); }}
                                         className="relative rounded-md shadow-2xl overflow-hidden"
                                         style={{
                                             width: '100%',
@@ -6863,6 +8862,11 @@ export default function VideoEditor() {
                                             backgroundSize: '100% 100%'
                                         }}
                                     >
+                                        {/* U-38: рамка виділення */}
+                                        {marqueeRect && (
+                                            <div className="absolute border-2 border-[#7c3aed] bg-violet-500/10 pointer-events-none z-[998]"
+                                                style={{ left: marqueeRect.x, top: marqueeRect.y, width: marqueeRect.w, height: marqueeRect.h }} />
+                                        )}
                                         {vSlide.objects.map((obj, idx) => {
                                             const isObjSelected = obj.id === selectedObjectId;
                                             const isMultiSelected = multiSelectedIds.includes(obj.id);
@@ -6890,6 +8894,12 @@ export default function VideoEditor() {
                                                     onDoubleClick={(e) => {
                                                         if (obj.type === 'text') { e.stopPropagation(); setSelectedObjectId(obj.id); setEditingObjectId(obj.id); setMultiSelectedIds([]); }
                                                     }}
+                                                    onContextMenu={(e) => { // U-42
+                                                        if (interactiveMode) return;
+                                                        e.preventDefault(); e.stopPropagation();
+                                                        setSelectedObjectId(obj.id); setMultiSelectedIds([]);
+                                                        setCtxMenu({ x: e.clientX, y: e.clientY, objId: obj.id });
+                                                    }}
                                                     className={`absolute ${isEditing ? 'cursor-text' : 'cursor-move'} ${isObjSelected ? 'ring-2 ring-[#7c3aed]' : isMultiSelected ? 'ring-2 ring-[#7c3aed]/60' : 'hover:ring-1 hover:ring-[#7c3aed]/40'}`}
                                                     style={{
                                                         left: obj.x * editorScale,
@@ -6909,9 +8919,13 @@ export default function VideoEditor() {
                                                             onMouseDown={(e) => e.stopPropagation()}
                                                             onBlur={(e) => {
                                                                 const base = obj.lines?.[0] || { color: '#1e293b', fontSize: 24, bold: false, align: 'l' };
-                                                                const newLines = e.target.value.split('\n').map((t, i) => ({
-                                                                    ...(obj.lines?.[i] || base), text: t, runs: undefined, bullet: undefined
-                                                                }));
+                                                                // U-35: незмінені рядки лишаємо як є — стилі рунів і формули
+                                                                // (MathML) зберігаються; руни скидаються лише у правлених рядках
+                                                                const newLines = e.target.value.split('\n').map((t, i) => {
+                                                                    const prev = obj.lines?.[i];
+                                                                    if (prev && prev.text === t) return prev;
+                                                                    return { ...(prev || base), text: t, runs: undefined, bullet: undefined };
+                                                                });
                                                                 dispatchVideo({ type: 'UPDATE_OBJECT', slideId: vSlide.id, objectId: obj.id, updates: { lines: newLines } });
                                                                 setEditingObjectId(null);
                                                             }}
@@ -7197,6 +9211,25 @@ export default function VideoEditor() {
                                     </div>
                                 </div>
 
+                                {/* U-40/U-41: вирівнювання та розподіл для мультивиділення */}
+                                {multiSelectedIds.length > 1 && (
+                                    <div className="px-4 py-3 space-y-1.5">
+                                        <span className="text-[10px] font-bold text-slate-400 uppercase">Вирівняти ({multiSelectedIds.length} об'єктів)</span>
+                                        <div className="grid grid-cols-3 gap-1">
+                                            {[['l', 'Ліво'], ['cx', 'Центр'], ['r', 'Право'], ['t', 'Верх'], ['cy', 'Серед.'], ['b', 'Низ']].map(([m, lbl]) => (
+                                                <button key={m} onClick={() => alignSelected(m)}
+                                                    className="px-1 py-1.5 bg-slate-50 hover:bg-violet-50 hover:text-[#7c3aed] border border-slate-200 rounded text-[10px] font-bold text-slate-600 transition-colors">{lbl}</button>
+                                            ))}
+                                        </div>
+                                        {multiSelectedIds.length > 2 && (
+                                            <div className="grid grid-cols-2 gap-1">
+                                                <button onClick={() => alignSelected('distH')} className="px-1 py-1.5 bg-slate-50 hover:bg-violet-50 hover:text-[#7c3aed] border border-slate-200 rounded text-[10px] font-bold text-slate-600 transition-colors" title="Рівні проміжки по горизонталі">↔ Розподілити</button>
+                                                <button onClick={() => alignSelected('distV')} className="px-1 py-1.5 bg-slate-50 hover:bg-violet-50 hover:text-[#7c3aed] border border-slate-200 rounded text-[10px] font-bold text-slate-600 transition-colors" title="Рівні проміжки по вертикалі">↕ Розподілити</button>
+                                            </div>
+                                        )}
+                                    </div>
+                                )}
+
                             </div>
                         )}
 
@@ -7217,6 +9250,19 @@ export default function VideoEditor() {
                                     >
                                         {renderVoiceOptions()}
                                     </select>
+                                    {/* U-63: прослухати зразок обраного голосу */}
+                                    <button
+                                        onClick={() => playVoiceSample(videoVoice.voice)}
+                                        disabled={voiceSampleLoading}
+                                        className="text-[9px] font-bold text-slate-400 hover:text-[#7c3aed] underline underline-offset-2 disabled:opacity-50"
+                                        title="Прослухати, як звучить обраний голос"
+                                    >{voiceSampleLoading ? '…' : '▶ Зразок'}</button>
+                                    {/* U-102: словник вимови складних термінів */}
+                                    <button
+                                        onClick={() => setPronDictOpen(true)}
+                                        className="text-[9px] font-bold text-slate-400 hover:text-[#7c3aed] underline underline-offset-2"
+                                        title="Словник вимови: як диктор читає складні терміни й наголоси"
+                                    >Вимова{pronDict.length ? ` (${pronDict.length})` : ''}</button>
                                     {videoDialog && <span className="text-[8px] font-bold text-indigo-500">Диктор 1</span>}
                                 </div>
                                 {/* Текст сценарію */}
@@ -7264,7 +9310,7 @@ export default function VideoEditor() {
                                                     <option value="slow">Повільно</option><option value="normal">Нормально</option><option value="fast">Швидко</option>
                                                 </select>
                                                 <select value={videoVoice2.style} onChange={(e) => updateVideoVoice2({ style: e.target.value })} className="text-[9px] border border-slate-200 rounded px-1 py-0.5 outline-none bg-white">
-                                                    <option value="neutral">Нейтральний</option><option value="cheerful">Радісний</option><option value="serious">Серйозний</option><option value="calm">Спокійний</option><option value="dramatic">Драматичний</option><option value="storytelling">Розповідний</option>
+                                                    <option value="neutral">Нейтральний</option><option value="cheerful">Радісний</option><option value="serious">Серйозний</option><option value="calm">Спокійний</option><option value="dramatic">Драматичний</option><option value="storytelling">Розповідний</option><option value="energetic">Енергійний</option><option value="friendly">Дружній</option><option value="teacher">Викладач</option>
                                                 </select>
                                                 <div className="flex items-center gap-1 border border-slate-200 rounded px-1 py-0.5 bg-white">
                                                     <span className="text-[9px] text-slate-400" title="Затримка перед початком читання">Затримка:</span>
@@ -7296,6 +9342,9 @@ export default function VideoEditor() {
                                                 <option value="calm">Спокійний</option>
                                                 <option value="dramatic">Драматичний</option>
                                                 <option value="storytelling">Розповідний</option>
+                                                <option value="energetic">Енергійний</option>
+                                                <option value="friendly">Дружній</option>
+                                                <option value="teacher">Викладач</option>
                                             </select>
                                             <div className="flex items-center gap-1 border border-slate-200 rounded px-1 py-0.5 bg-white focus-within:border-[#7c3aed]">
                                                 <span className="text-[10px] text-slate-400" title="Затримка перед початком читання">Затримка:</span>
@@ -7552,6 +9601,27 @@ export default function VideoEditor() {
                                                     <>
                                                         <input value={selectedObject.label || ''} onChange={(e) => dispatchVideo({ type: 'UPDATE_OBJECT', slideId: vSlide.id, objectId: selectedObject.id, updates: { label: e.target.value } })} placeholder="Мітка (напр. i, ?)" className="w-full text-xs border border-slate-200 rounded px-2 py-1 outline-none focus:border-[#7c3aed]" />
                                                         <textarea value={selectedObject.content || ''} onChange={(e) => dispatchVideo({ type: 'UPDATE_OBJECT', slideId: vSlide.id, objectId: selectedObject.id, updates: { content: e.target.value } })} placeholder="Текст підказки" className="w-full text-xs border border-slate-200 rounded px-2 py-1 outline-none focus:border-[#7c3aed] resize-y min-h-[56px]" />
+                                                    </>
+                                                )}
+                                                {selectedObject.iType === 'fact' && (
+                                                    <>
+                                                        <input value={selectedObject.title || ''} onChange={(e) => dispatchVideo({ type: 'UPDATE_OBJECT', slideId: vSlide.id, objectId: selectedObject.id, updates: { title: e.target.value } })} placeholder="Заголовок факту" className="w-full text-xs border border-slate-200 rounded px-2 py-1 outline-none focus:border-[#7c3aed]" />
+                                                        <textarea value={selectedObject.content || ''} onChange={(e) => dispatchVideo({ type: 'UPDATE_OBJECT', slideId: vSlide.id, objectId: selectedObject.id, updates: { content: e.target.value } })} placeholder="Текст цікавого факту" className="w-full text-xs border border-slate-200 rounded px-2 py-1 outline-none focus:border-[#7c3aed] resize-y min-h-[64px]" />
+                                                        <label className="w-full text-[10px] font-bold text-violet-600 hover:text-violet-800 cursor-pointer flex items-center gap-1">
+                                                            🖼 {selectedObject.image ? 'Замінити картинку' : 'Додати картинку'}
+                                                            <input type="file" accept="image/*" className="hidden" onChange={(e) => {
+                                                                const f = e.target.files && e.target.files[0];
+                                                                if (!f) return;
+                                                                const rd = new FileReader();
+                                                                rd.onload = (ev) => dispatchVideo({ type: 'UPDATE_OBJECT', slideId: vSlide.id, objectId: selectedObject.id, updates: { image: ev.target.result } });
+                                                                rd.readAsDataURL(f);
+                                                                e.target.value = '';
+                                                            }} />
+                                                        </label>
+                                                        {selectedObject.image && (
+                                                            <button onClick={() => dispatchVideo({ type: 'UPDATE_OBJECT', slideId: vSlide.id, objectId: selectedObject.id, updates: { image: null } })} className="text-[10px] font-bold text-red-400 hover:text-red-600">✕ прибрати картинку</button>
+                                                        )}
+                                                        <p className="text-[9px] text-slate-400">У режимі перегляду факт показується ★-точкою — клік розкриває картку з фото і текстом.</p>
                                                     </>
                                                 )}
                                                 {selectedObject.iType === 'link' && (
@@ -7920,8 +9990,18 @@ export default function VideoEditor() {
                                                 return (
                                                     <>
                                                         {canGroup && (
-                                                            <button onClick={() => { dispatchVideo({ type: 'GROUP_OBJECTS', slideId: vSlide.id, objectIds: curSel }); logChange('Групування', 'Згруповано об\'єкти'); }} className="text-[9px] px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-600 hover:bg-indigo-100 font-semibold transition-colors">
-                                                                Згрупувати
+                                                            <button
+                                                                onClick={() => {
+                                                                    dispatchVideo({ type: 'GROUP_OBJECTS', slideId: vSlide.id, objectIds: curSel });
+                                                                    logChange('Групування', `Об'єднано шари: ${curSel.length}`);
+                                                                    toast('success', `Шари об'єднано (${curSel.length}) — тепер рухаються як один`, {
+                                                                        action: { label: 'Повернути', onClick: () => dispatchVideo({ type: 'UNDO' }) }
+                                                                    });
+                                                                }}
+                                                                className="text-[9px] px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-600 hover:bg-indigo-100 font-semibold transition-colors flex items-center gap-0.5"
+                                                                title="Об'єднати відмічені шари в один — переміщуються і виділяються разом"
+                                                            >
+                                                                <Combine size={9} /> Об'єднати ({curSel.length})
                                                             </button>
                                                         )}
                                                         {hasGroups && (
@@ -8014,6 +10094,29 @@ export default function VideoEditor() {
                                                         }
                                                     }}
                                                 >
+                                                    {/* Галочка вибору шарів для об'єднання (групи міняються цілком) */}
+                                                    <input
+                                                        type="checkbox"
+                                                        checked={isMulti || isSel}
+                                                        onClick={(e) => e.stopPropagation()}
+                                                        onChange={(e) => {
+                                                            e.stopPropagation();
+                                                            const ids = obj.groupId
+                                                                ? vSlide.objects.filter(o => o.groupId === obj.groupId).map(o => o.id)
+                                                                : [obj.id];
+                                                            if (e.target.checked) {
+                                                                const next = [...new Set([...multiSelectedIds, ...(selectedObjectId ? [selectedObjectId] : []), ...ids])];
+                                                                setMultiSelectedIds(next);
+                                                                setSelectedObjectId(null);
+                                                            } else {
+                                                                setMultiSelectedIds(multiSelectedIds.filter(id => !ids.includes(id)));
+                                                                if (selectedObjectId && ids.includes(selectedObjectId)) setSelectedObjectId(null);
+                                                            }
+                                                        }}
+                                                        aria-label="Відмітити шар для об'єднання"
+                                                        title="Відмітьте 2+ шари — з'явиться кнопка «Об'єднати»"
+                                                        className="accent-[#7c3aed] w-3 h-3 flex-shrink-0 cursor-pointer"
+                                                    />
                                                     <span className="w-4 text-[8px] text-slate-300 font-mono text-right flex-shrink-0">
                                                         {obj.groupId ? <Combine size={8} className="inline-block text-indigo-400" title="Згруповано" /> : realIdx + 1}
                                                     </span>
@@ -8050,6 +10153,7 @@ export default function VideoEditor() {
                         )}
                     </div>
                 </div>
+                </UIErrorBoundary>
             )}
         </div>
     );
