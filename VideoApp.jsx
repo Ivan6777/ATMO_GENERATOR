@@ -6002,6 +6002,57 @@ export default function VideoEditor() {
         logChange('Об\'єкт', `Додано бігучий рядок на слайд ${selectedSlide.slideNumber}`);
     };
 
+    // Вставка медіафайлу (відео/зображення) на слайд: з буфера або перетягуванням.
+    // Відео — через blob:-URL (без роздування пам'яті base64-ом), розмір — з метаданих.
+    const insertMediaFileOnSlide = (file, atX, atY) => {
+        if (!selectedSlide || !file) return false;
+        const isVid = /^video\//.test(file.type || '') || /\.(mp4|mov|webm|m4v|ogv)$/i.test(file.name || '');
+        const isImg = /^image\//.test(file.type || '');
+        if (!isVid && !isImg) return false;
+        const place = (w, h, extra) => {
+            const W = Math.min(w, CANVAS_W), H = Math.min(h, CANVAS_H);
+            const x = atX != null ? Math.round(Math.max(0, Math.min(atX - W / 2, CANVAS_W - W))) : Math.round((CANVAS_W - W) / 2);
+            const y = atY != null ? Math.round(Math.max(0, Math.min(atY - H / 2, CANVAS_H - H))) : Math.round((CANVAS_H - H) / 2);
+            const object = {
+                id: crypto.randomUUID(), x, y, w: Math.round(W), h: Math.round(H),
+                animation: { type: 'fadeIn', delay: 0, duration: 0.8 }, ...extra
+            };
+            dispatchVideo({ type: 'ADD_OBJECT', slideId: selectedSlide.id, object });
+            setSelectedObjectId(object.id);
+        };
+        if (isVid) {
+            const src = URL.createObjectURL(file);
+            const probe = document.createElement('video');
+            probe.preload = 'metadata';
+            probe.onloadedmetadata = () => {
+                const vw = probe.videoWidth || 640, vh = probe.videoHeight || 360;
+                const k = Math.min(880 / vw, 500 / vh, 1);
+                place(vw * k, vh * k, { type: 'video', src, videoFitMode: 'loop' });
+                loadVideo(src); // одразу гріємо для прев'ю/експорту
+                toast('success', `Відео «${file.name || 'з буфера'}» додано на слайд`);
+                logChange('Вставка', 'Додано відео (файл/буфер)', { name: file.name, size: file.size });
+            };
+            probe.onerror = () => {
+                place(640, 360, { type: 'video', src, videoFitMode: 'loop' });
+                toast('info', 'Відео додано (розмір типовий — метадані не прочитались)');
+            };
+            probe.src = src;
+            return true;
+        }
+        const rd = new FileReader();
+        rd.onload = (ev) => {
+            const img = new Image();
+            img.onload = () => {
+                const k = Math.min(880 / img.width, 500 / img.height, 1);
+                place(img.width * k, img.height * k, { type: 'image', src: ev.target.result });
+                toast('success', `Зображення «${file.name || 'з буфера'}» додано`);
+            };
+            img.src = ev.target.result;
+        };
+        rd.readAsDataURL(file);
+        return true;
+    };
+
     const addTextObject = () => {
         if (!selectedSlide) return;
         const object = {
@@ -6171,6 +6222,16 @@ export default function VideoEditor() {
             // Якщо в HTML є справжній текст — вставляємо ТЕКСТ, а не його картинку.
             const htmlText = pastedHtmlDoc ? (pastedHtmlDoc.body.textContent || '').trim() : '';
             const hasHtmlText = htmlText.length > 0;
+
+            // Файли в буфері (копіювання з провідника/Finder): відео та зображення
+            const cbFiles = (e.clipboardData && e.clipboardData.files) || [];
+            for (const f of cbFiles) {
+                if (/^video\//.test(f.type || '')) {
+                    e.preventDefault();
+                    insertMediaFileOnSlide(f, null, null);
+                    return;
+                }
+            }
 
             const items = (e.clipboardData && e.clipboardData.items) || [];
             for (const it of items) {
@@ -8686,6 +8747,22 @@ export default function VideoEditor() {
                                     <div
                                         ref={workspaceRef}
                                         onMouseDown={(e) => { if (e.target === e.currentTarget && !interactiveMode) startMarquee(e); }}
+                                        onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; }}
+                                        onDrop={(e) => {
+                                            // Перетягніть відео/зображення-файл на слайд — вставиться в точці кидання.
+                                            // (Відео з буфера PowerPoint браузер не віддає — лише постер; тому файл.)
+                                            const fl = e.dataTransfer && e.dataTransfer.files;
+                                            if (!fl || !fl.length) return;
+                                            e.preventDefault(); e.stopPropagation();
+                                            const host = workspaceRef.current ? workspaceRef.current.getBoundingClientRect() : null;
+                                            const sc = editorScaleRef.current || 1;
+                                            const ax = host ? (e.clientX - host.left) / sc : null;
+                                            const ay = host ? (e.clientY - host.top) / sc : null;
+                                            for (const f of Array.from(fl)) {
+                                                if (insertMediaFileOnSlide(f, ax, ay)) return;
+                                            }
+                                            toast('info', 'Перетягніть відео (MP4/MOV/WebM) або зображення');
+                                        }}
                                         className="relative rounded-md shadow-2xl overflow-hidden"
                                         style={{
                                             width: '100%',
