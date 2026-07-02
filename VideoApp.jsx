@@ -4083,6 +4083,17 @@ const drawTransitionFrame = (ctx, prevCanvas, nextCanvas, type, progress) => {
 };
 
 // Повна тривалість слайду: аудіо + хвіст, або час завершення останньої анімації
+// Тривалість переходу ДО слайда: власне значення slide.transitionDuration
+// (0.1–5с) або типова тривалість ефекту. Для 'none'/'cut' завжди 0.
+const getTransitionDuration = (slide) => {
+    const def = TRANSITIONS[slide.transition] || TRANSITIONS.none;
+    const base = def.duration || 0;
+    if (base <= 0) return 0;
+    return slide.transitionDuration != null
+        ? Math.max(0.1, Math.min(Number(slide.transitionDuration) || base, 5))
+        : base;
+};
+
 const getSlideDuration = (slide) => {
     const animEnd = (slide.objects || []).reduce((m, o) => {
         const a = o.animation;
@@ -6288,9 +6299,9 @@ export default function VideoEditor() {
             const segments = [];
             let prev = null;
             for (const s of slides) {
-                const def = TRANSITIONS[s.transition] || TRANSITIONS.none;
-                if (prev && def.duration > 0) {
-                    segments.push({ kind: 'transition', prev, next: s, type: s.transition, dur: def.duration });
+                const tDur = getTransitionDuration(s);
+                if (prev && tDur > 0) {
+                    segments.push({ kind: 'transition', prev, next: s, type: s.transition, dur: tDur });
                 }
                 segments.push({ kind: 'slide', slide: s, dur: getSlideDuration(s) });
                 prev = s;
@@ -6495,14 +6506,14 @@ export default function VideoEditor() {
 
             // U-23: повна тривалість майбутнього відео (слайди + переходи) для ETA
             const totalExportSec = slides.reduce((acc, sl, k) =>
-                acc + getSlideDuration(sl) + (k > 0 ? ((TRANSITIONS[sl.transition] || TRANSITIONS.none).duration || 0) : 0), 0);
+                acc + getSlideDuration(sl) + (k > 0 ? getTransitionDuration(sl) : 0), 0);
 
             let prevSlide = null;
 
             for (let i = 0; i < slides.length; i++) {
                 const slide = slides[i];
                 const slideDuration = getSlideDuration(slide);
-                const transitionDef = TRANSITIONS[slide.transition] || TRANSITIONS.none;
+                const transDur = getTransitionDuration(slide);
 
                 // Спершу ПІДГОТОВКА вбудованих відео та аудіо (асинхронно).
                 await primeSlideVideos(slide);
@@ -6524,11 +6535,11 @@ export default function VideoEditor() {
                 }
 
                 // Анімація переходу: попередній слайд (фінальний стан) -> поточний (стан t=0)
-                if (i > 0 && prevSlide && transitionDef.duration > 0) {
+                if (i > 0 && prevSlide && transDur > 0) {
                     const prevCanvas = renderSlideToCanvas(prevSlide, getSlideDuration(prevSlide) + 10);
                     const nextCanvas = renderSlideToCanvas(slide, 0);
-                    await drawTimed(transitionDef.duration, (t) => {
-                        drawTransitionFrame(ctx, prevCanvas, nextCanvas, slide.transition, t / transitionDef.duration);
+                    await drawTimed(transDur, (t) => {
+                        drawTransitionFrame(ctx, prevCanvas, nextCanvas, slide.transition, t / transDur);
                     });
                 }
 
@@ -6641,7 +6652,7 @@ export default function VideoEditor() {
         let t = 0; const placements = [];
         for (let i = 0; i < slides.length; i++) {
             const s = slides[i];
-            if (i > 0) { const td = TRANSITIONS[s.transition] || TRANSITIONS.none; t += td.duration || 0; }
+            if (i > 0) t += getTransitionDuration(s);
             if (s.audioBase64) {
                 const bin = atob(s.audioBase64); const bytes = new Uint8Array(bin.length);
                 for (let k = 0; k < bin.length; k++) bytes[k] = bin.charCodeAt(k);
@@ -7569,6 +7580,31 @@ export default function VideoEditor() {
                         ))}
                     </select>
                 </label>
+                {/* Тривалість переходу — власне значення на слайд (0.1–5с) */}
+                {(TRANSITIONS[slide.transition]?.duration || 0) > 0 && (
+                    <label className="flex items-center gap-2 text-[11px] font-semibold text-slate-500">
+                        Тривалість переходу
+                        <input
+                            type="number" step="0.1" min="0.1" max="5"
+                            value={slide.transitionDuration != null ? slide.transitionDuration : (TRANSITIONS[slide.transition]?.duration || 0.8)}
+                            onChange={(e) => {
+                                const v = Math.max(0.1, Math.min(parseFloat(e.target.value) || 0.8, 5));
+                                dispatchVideo({ type: 'UPDATE_SLIDE', slideId: slide.id, updates: { transitionDuration: v } });
+                                logChange('Перехід', `Слайд ${slide.slideNumber}: тривалість переходу → ${v}с`);
+                            }}
+                            className="w-16 px-1.5 py-1 text-xs border border-slate-200 rounded-lg outline-none focus:border-[#16a34a] bg-white"
+                            title="Скільки секунд триває ефект переходу до цього слайда (0.1–5с)"
+                        />
+                        <span className="text-slate-300 text-[10px]">сек</span>
+                        {slide.transitionDuration != null && (
+                            <button
+                                onClick={() => dispatchVideo({ type: 'UPDATE_SLIDE', slideId: slide.id, updates: { transitionDuration: null } })}
+                                className="text-[10px] font-bold text-slate-400 hover:text-[#16a34a] underline"
+                                title="Повернути типову тривалість ефекту"
+                            >типова</button>
+                        )}
+                    </label>
+                )}
 
                 {/* Швидкі пресети анімацій (без AI) */}
                 <div className="space-y-1.5">
@@ -8240,7 +8276,7 @@ export default function VideoEditor() {
                                                 <ExportReadiness
                                                     slidesTotal={slides.length}
                                                     unvoiced={slides.filter(s => s.text.trim() && !s.audioBase64).length}
-                                                    durationSec={slides.reduce((acc, s, i) => acc + getSlideDuration(s) + (i > 0 ? ((TRANSITIONS[s.transition] || TRANSITIONS.none).duration || 0) : 0), 0)}
+                                                    durationSec={slides.reduce((acc, s, i) => acc + getSlideDuration(s) + (i > 0 ? getTransitionDuration(s) : 0), 0)}
                                                     isGenerating={isGeneratingAll}
                                                     onGenerateMissing={generateAllMissingSlidesAudio}
                                                 />
