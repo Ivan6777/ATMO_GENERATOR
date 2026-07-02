@@ -969,7 +969,10 @@ const sniffImageMime = (b) => {
 const VIDEO_MIME_BY_EXT = {
     mp4: 'video/mp4', m4v: 'video/mp4', mov: 'video/quicktime', webm: 'video/webm',
     ogv: 'video/ogg', ogg: 'video/ogg', mpeg: 'video/mpeg', mpg: 'video/mpeg',
-    avi: 'video/x-msvideo', wmv: 'video/x-ms-wmv', mkv: 'video/x-matroska'
+    avi: 'video/x-msvideo', wmv: 'video/x-ms-wmv', mkv: 'video/x-matroska',
+    // Аудіо на слайдах (a:audioFile): без правильного mime Safari відмовлявся грати
+    mp3: 'audio/mpeg', wav: 'audio/wav', m4a: 'audio/mp4', aac: 'audio/aac',
+    oga: 'audio/ogg', flac: 'audio/flac', wma: 'audio/x-ms-wma', opus: 'audio/ogg'
 };
 
 // Маркери вшитого проєкту у експортованому відео (зворотна конвертація MP4 → редактор)
