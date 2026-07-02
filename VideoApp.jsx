@@ -9735,8 +9735,18 @@ export default function VideoEditor() {
                                                 return (
                                                     <>
                                                         {canGroup && (
-                                                            <button onClick={() => { dispatchVideo({ type: 'GROUP_OBJECTS', slideId: vSlide.id, objectIds: curSel }); logChange('Групування', 'Згруповано об\'єкти'); }} className="text-[9px] px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-600 hover:bg-indigo-100 font-semibold transition-colors">
-                                                                Згрупувати
+                                                            <button
+                                                                onClick={() => {
+                                                                    dispatchVideo({ type: 'GROUP_OBJECTS', slideId: vSlide.id, objectIds: curSel });
+                                                                    logChange('Групування', `Об'єднано шари: ${curSel.length}`);
+                                                                    toast('success', `Шари об'єднано (${curSel.length}) — тепер рухаються як один`, {
+                                                                        action: { label: 'Повернути', onClick: () => dispatchVideo({ type: 'UNDO' }) }
+                                                                    });
+                                                                }}
+                                                                className="text-[9px] px-1.5 py-0.5 rounded bg-indigo-50 text-indigo-600 hover:bg-indigo-100 font-semibold transition-colors flex items-center gap-0.5"
+                                                                title="Об'єднати відмічені шари в один — переміщуються і виділяються разом"
+                                                            >
+                                                                <Combine size={9} /> Об'єднати ({curSel.length})
                                                             </button>
                                                         )}
                                                         {hasGroups && (
@@ -9829,6 +9839,29 @@ export default function VideoEditor() {
                                                         }
                                                     }}
                                                 >
+                                                    {/* Галочка вибору шарів для об'єднання (групи міняються цілком) */}
+                                                    <input
+                                                        type="checkbox"
+                                                        checked={isMulti || isSel}
+                                                        onClick={(e) => e.stopPropagation()}
+                                                        onChange={(e) => {
+                                                            e.stopPropagation();
+                                                            const ids = obj.groupId
+                                                                ? vSlide.objects.filter(o => o.groupId === obj.groupId).map(o => o.id)
+                                                                : [obj.id];
+                                                            if (e.target.checked) {
+                                                                const next = [...new Set([...multiSelectedIds, ...(selectedObjectId ? [selectedObjectId] : []), ...ids])];
+                                                                setMultiSelectedIds(next);
+                                                                setSelectedObjectId(null);
+                                                            } else {
+                                                                setMultiSelectedIds(multiSelectedIds.filter(id => !ids.includes(id)));
+                                                                if (selectedObjectId && ids.includes(selectedObjectId)) setSelectedObjectId(null);
+                                                            }
+                                                        }}
+                                                        aria-label="Відмітити шар для об'єднання"
+                                                        title="Відмітьте 2+ шари — з'явиться кнопка «Об'єднати»"
+                                                        className="accent-[#7c3aed] w-3 h-3 flex-shrink-0 cursor-pointer"
+                                                    />
                                                     <span className="w-4 text-[8px] text-slate-300 font-mono text-right flex-shrink-0">
                                                         {obj.groupId ? <Combine size={8} className="inline-block text-indigo-400" title="Згруповано" /> : realIdx + 1}
                                                     </span>
