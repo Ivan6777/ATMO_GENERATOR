@@ -1,4 +1,11 @@
 import React, { useState, useReducer, useRef, useEffect, useCallback } from 'react';
+import {
+    toast, ToastHost, ShortcutsModal, Kbd,
+    useAutosave, useBeforeUnloadGuard, AutosaveIndicator,
+    loadProjectSnapshot, clearProjectSnapshot,
+    RestoreBanner, ImportProgressOverlay, ExportReadiness, formatDuration,
+    validatePptxFile, humanizeTtsError
+} from './UXKit.jsx';
 /* ============================================================================
  * ІКОНКИ — inline SVG (замість lucide-react CDN, що не резолвиться у цьому
  * рантаймі: babel-standalone + React UMD не надає named-export'ів lucide-react).
@@ -1608,7 +1615,9 @@ const extractTextLines = (txBody, ptToPx, defaults = {}) => {
 
 // Головна функція парсингу: повертає нормалізований масив слайдів зі списком об'єктів.
 // Стійкість: помилка окремого слайду чи фігури не зриває імпорт усієї презентації.
-const extractPptxData = async (file) => {
+// onProgress({ stage, current, total }) — живий прогрес для UI (U-19); між слайдами
+// цикл поступається головному потоку (U-90), щоб інтерфейс не «замерзав».
+const extractPptxData = async (file, onProgress) => {
     const JSZip = await loadJSZip();
     const zip = await JSZip.loadAsync(file);
     const parser = new DOMParser();
@@ -1681,6 +1690,7 @@ const extractPptxData = async (file) => {
     const presDoc = await parseXml('ppt/presentation.xml');
     if (!presDoc) throw new Error("У файлі не знайдено ppt/presentation.xml");
     const sldIds = presDoc.querySelectorAll('sldIdLst sldId');
+    if (onProgress) onProgress({ stage: 'Читаємо тему, шрифти та макети…', current: 0, total: sldIds.length });
 
     const sldSzEl = presDoc.querySelector('sldSz, p\\:sldSz');
     const slideWidthEmu = sldSzEl ? parseInt(sldSzEl.getAttribute('cx'), 10) : 12192000;
@@ -2245,6 +2255,9 @@ const extractPptxData = async (file) => {
     const extractedSlides = [];
 
     for (let i = 0; i < sldIds.length; i++) {
+        if (onProgress) onProgress({ stage: `Розбираємо слайд ${i + 1} з ${sldIds.length}…`, current: i, total: sldIds.length });
+        // Поступаємось головному потоку: прогрес малюється, UI лишається живим (U-90)
+        await new Promise(r => setTimeout(r, 0));
         try {
             const rId = sldIds[i].getAttribute('r:id');
             const rel = presRelsDoc.querySelector(`Relationship[Id="${rId}"]`);
@@ -3632,6 +3645,36 @@ export default function VideoEditor() {
     const [videoDialog, setVideoDialog] = useState(false);
     const [interactiveMode, setInteractiveMode] = useState(false); // режим «гра» для H5P-інтерактивів
     const [exportMenuOpen, setExportMenuOpen] = useState(false);    // меню форматів експорту
+
+    // ── UXKit (Спринт 1): прогрес імпорту, довідка клавіш, автозбереження, відновлення ──
+    const [importProgress, setImportProgress] = useState(null);     // { stage, current, total } | null (U-19)
+    const [shortcutsOpen, setShortcutsOpen] = useState(false);      // модал гарячих клавіш (U-72)
+    const [restoreSnapshot, setRestoreSnapshot] = useState(null);   // збережена сесія для банера (U-02)
+    const autosave = useAutosave(slides);                           // IndexedDB, дебаунс 2.5с (U-01/U-04)
+    const autosaveDirtyRef = autosave.dirtyRef;
+    const shouldWarnBeforeUnload = useCallback(
+        () => autosaveDirtyRef.current === true,
+        [autosaveDirtyRef]
+    );
+    useBeforeUnloadGuard(shouldWarnBeforeUnload);                   // U-03
+    useEffect(() => {                                               // разова перевірка збереженої сесії
+        let alive = true;
+        loadProjectSnapshot().then(snap => { if (alive && snap) setRestoreSnapshot(snap); });
+        return () => { alive = false; };
+    }, []);
+    const restoreSession = () => {
+        if (!restoreSnapshot) return;
+        dispatchVideo({ type: 'SET_SLIDES', slides: restoreSnapshot.slides });
+        setSelectedSlideId(restoreSnapshot.slides[0]?.id || null);
+        setSelectedObjectId(null);
+        setRestoreSnapshot(null);
+        toast('success', `Сесію відновлено: ${restoreSnapshot.slides.length} слайд(ів)`);
+        logChange('Сесія', 'Відновлено автозбережений проєкт', { slides: restoreSnapshot.slides.length });
+    };
+    const dismissRestore = () => {
+        clearProjectSnapshot();
+        setRestoreSnapshot(null);
+    };
     const [pauseSeconds, setPauseSeconds] = useState(1);             // тривалість паузи (сек), яку вставляє кнопка [ПАУЗА]
     const updateVideoVoice2 = (updates) => {
         setVideoVoice2(prev => ({ ...prev, ...updates }));
@@ -3749,6 +3792,10 @@ export default function VideoEditor() {
                     dispatchVideo({ type: 'DELETE_OBJECTS', slideId: selectedSlideId, objectIds: ids });
                     setSelectedObjectId(null);
                     setMultiSelectedIds([]);
+                    // U-08: скасування видалення об'єктів одним кліком
+                    toast('info', ids.length === 1 ? 'Об\'єкт видалено' : `Видалено об'єктів: ${ids.length}`, {
+                        action: { label: 'Повернути', onClick: () => dispatchVideo({ type: 'UNDO' }) }
+                    });
                 }
                 return;
             }
@@ -3793,6 +3840,8 @@ export default function VideoEditor() {
                 return;
             }
 
+            if (e.key === '?') { e.preventDefault(); setShortcutsOpen(true); return; } // U-72
+
             const step = shift ? 10 : 1;
             if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key) && selectedSlideId) {
                 e.preventDefault();
@@ -3819,19 +3868,30 @@ export default function VideoEditor() {
      * ====================================================================== */
 
     const processPPTXFile = async (file) => {
+        // U-17: зрозуміла відмова ДО парсингу (не .pptx / пошкоджений ZIP)
+        const check = await validatePptxFile(file);
+        if (!check.ok) {
+            setFileError(check.reason);
+            toast('error', check.reason);
+            return;
+        }
         setIsProcessingPPTX(true);
         setFileError(null);
         try {
-            const extracted = await extractPptxData(file);
+            const extracted = await extractPptxData(file, setImportProgress);
             dispatchVideo({ type: 'SET_SLIDES', slides: extracted });
             setSelectedSlideId(extracted[0]?.id || null);
             setSelectedObjectId(null);
+            setRestoreSnapshot(null); // імпортовано новий проєкт — банер відновлення більше не актуальний
+            toast('success', `Імпортовано «${file.name}»: ${extracted.length} слайд(ів)`);
             logChange('Імпорт', `Завантажено файл "${file.name}"`, { slides: extracted.length });
         } catch (err) {
             setFileError("Помилка читання PPTX: " + err.message);
+            toast('error', 'Не вдалося прочитати PPTX: ' + err.message);
             logChange('Помилка', `Не вдалося прочитати PPTX "${file.name}"`, err.message);
         } finally {
             setIsProcessingPPTX(false);
+            setImportProgress(null);
         }
     };
 
@@ -4056,7 +4116,9 @@ export default function VideoEditor() {
             logChange('Озвучка', `Згенеровано аудіо слайда ${slide.slideNumber}${videoDialog ? ' (2 диктори)' : ''}`, { duration: `${dur.toFixed(1)}с`, voice: videoVoice.voice });
             // Анімації більше не скидаються автоматично при переозвучці!
         } catch (e) {
-            dispatchVideo({ type: 'UPDATE_SLIDE', slideId, updates: { isGenerating: false, error: e.message } });
+            const human = humanizeTtsError(e.message); // U-21: зрозуміле пояснення замість коду помилки
+            dispatchVideo({ type: 'UPDATE_SLIDE', slideId, updates: { isGenerating: false, error: human } });
+            toast('error', `Слайд ${slide.slideNumber}: ${human}`);
             logChange('Помилка', `Озвучка слайда ${slide.slideNumber} не вдалася`, e.message);
         }
     };
@@ -4064,9 +4126,11 @@ export default function VideoEditor() {
     const generateAllMissingSlidesAudio = async () => {
         setIsGeneratingAll(true);
         const toGenerate = slides.filter(s => s.text.trim() && !s.audioBase64);
+        if (toGenerate.length) toast('info', `Озвучуємо ${toGenerate.length} слайд(ів)…`);
         for (const slide of toGenerate) {
             await generateSlideAudio(slide.id);
         }
+        if (toGenerate.length) toast('success', 'Пакетну озвучку завершено'); // U-20
         setIsGeneratingAll(false);
     };
 
@@ -4533,11 +4597,18 @@ export default function VideoEditor() {
 
     const reimportPPTXFile = async (file) => {
         if (!file) return;
+        // U-17 + U-10: валідація файлу та підтвердження перезапису правок канваса
+        const check = await validatePptxFile(file);
+        if (!check.ok) { toast('error', check.reason); return; }
+        if (slides.length > 0 && !window.confirm(
+            'Оновити презентацію з PPTX?\n\nТексти диктора, переходи та озвучка збережуться, ' +
+            'але зміни обʼєктів на слайдах (переміщення, стилі, додані елементи) буде замінено вмістом файлу.'
+        )) return;
         stopPreview();
         setIsProcessingPPTX(true);
         setFileError(null);
         try {
-            const extracted = await extractPptxData(file);
+            const extracted = await extractPptxData(file, setImportProgress);
             const prevBySlideNumber = new Map(slides.map(s => [s.slideNumber, s]));
             const prevSelectedNumber = selectedSlide ? selectedSlide.slideNumber : null;
 
@@ -4558,12 +4629,15 @@ export default function VideoEditor() {
             const reselected = merged.find(s => s.slideNumber === prevSelectedNumber) || merged[0];
             setSelectedSlideId(reselected ? reselected.id : null);
             setSelectedObjectId(null);
+            toast('success', `Оновлено з «${file.name}»: тексти, озвучку й переходи збережено`);
             logChange('Імпорт', `Оновлено з PPTX "${file.name}" (текст, озвучка й переходи збережені)`, { slides: merged.length });
         } catch (err) {
             setFileError("Помилка повторної конвертації: " + err.message);
+            toast('error', 'Не вдалося оновити з PPTX: ' + err.message);
             logChange('Помилка', 'Повторна конвертація PPTX не вдалася', err.message);
         } finally {
             setIsProcessingPPTX(false);
+            setImportProgress(null);
         }
     };
 
@@ -4739,6 +4813,10 @@ export default function VideoEditor() {
             setSelectedSlideId(fallback ? fallback.id : null);
             setSelectedObjectId(null);
         }
+        // U-07: видалення можна миттєво скасувати прямо зі снекбара
+        toast('info', `Слайд ${idx + 1} видалено`, {
+            action: { label: 'Повернути', onClick: () => dispatchVideo({ type: 'UNDO' }) }
+        });
         logChange('Слайд', `Видалено слайд ${idx + 1}`);
     };
 
@@ -6434,9 +6512,23 @@ export default function VideoEditor() {
                 <span className="text-sm font-bold text-[#3D3D3A]">AI Video Studio</span>
             </div>
 
+            {/* ── UXKit: глобальні оверлеї (U-18 тости, U-19 прогрес імпорту, U-72 клавіші) ── */}
+            <ToastHost />
+            <ImportProgressOverlay progress={importProgress} />
+            <ShortcutsModal open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
+
             {slides.length === 0 ? (
                 /* ===== ЕКРАН ЗАВАНТАЖЕННЯ PPTX ===== */
-                <div className="flex-1 flex items-center justify-center p-8">
+                <div className="flex-1 flex flex-col items-center justify-center p-8">
+                    {/* U-02: пропозиція відновити автозбережену сесію */}
+                    {restoreSnapshot && (
+                        <RestoreBanner
+                            savedAt={restoreSnapshot.savedAt}
+                            slidesCount={restoreSnapshot.slides.length}
+                            onRestore={restoreSession}
+                            onDismiss={dismissRestore}
+                        />
+                    )}
                     <div
                         className={`w-full max-w-xl bg-white rounded-3xl shadow-lg transition-all overflow-hidden relative ${isDragging ? 'border-2 border-[#7c3aed] bg-purple-50/30' : 'border border-slate-200'}`}
                         onDrop={handleDrop}
@@ -6643,6 +6735,15 @@ export default function VideoEditor() {
                                 ))}
                             </div>
                             <div className="flex items-center gap-2">
+                                {/* U-04: стан автозбереження */}
+                                <AutosaveIndicator status={autosave.status} savedAt={autosave.savedAt} />
+                                {/* U-72: довідка гарячих клавіш */}
+                                <button
+                                    onClick={() => setShortcutsOpen(true)}
+                                    aria-label="Гарячі клавіші"
+                                    title="Гарячі клавіші (?)"
+                                    className="w-6 h-6 rounded-full border border-slate-300 text-slate-500 hover:bg-slate-100 text-xs font-bold"
+                                >?</button>
                                 <div className="flex items-center gap-0.5 mr-1 border-r border-slate-200 pr-2">
                                     <button onClick={() => dispatchVideo({ type: 'UNDO' })} disabled={!canUndo} className="p-1.5 rounded text-slate-500 hover:bg-slate-100 disabled:opacity-30 transition-colors" title="Undo (Ctrl+Z)">
                                         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="1 4 1 10 7 10" /><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10" /></svg>
@@ -6675,6 +6776,14 @@ export default function VideoEditor() {
                                         <>
                                             <div className="fixed inset-0 z-40" onClick={() => setExportMenuOpen(false)} />
                                             <div className="absolute right-0 mt-1 w-64 bg-white rounded-xl shadow-2xl border border-slate-200 z-50 overflow-hidden">
+                                                {/* U-70/U-71: готовність до експорту + тривалість майбутнього відео */}
+                                                <ExportReadiness
+                                                    slidesTotal={slides.length}
+                                                    unvoiced={slides.filter(s => s.text.trim() && !s.audioBase64).length}
+                                                    durationSec={slides.reduce((acc, s, i) => acc + getSlideDuration(s) + (i > 0 ? ((TRANSITIONS[s.transition] || TRANSITIONS.none).duration || 0) : 0), 0)}
+                                                    isGenerating={isGeneratingAll}
+                                                    onGenerateMissing={generateAllMissingSlidesAudio}
+                                                />
                                                 <div className="px-3 py-1.5 text-[10px] font-bold text-slate-400 uppercase tracking-wide bg-slate-50">Відео · 1920×1080 · H.264 · 30 fps · ~9 Мбіт/с</div>
                                                 <button onClick={() => { setExportMenuOpen(false); handleExportVideo({ withAudio: true }); }} className="w-full text-left px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-violet-50 flex items-center gap-2"><Film size={14} className="text-[#7c3aed]" /> MP4 зі звуком</button>
                                                 <button onClick={() => { setExportMenuOpen(false); handleExportVideo({ withAudio: false }); }} className="w-full text-left px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-violet-50 flex items-center gap-2"><Film size={14} className="text-slate-400" /> MP4 без звуку</button>
