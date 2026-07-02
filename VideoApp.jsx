@@ -3668,6 +3668,30 @@ const drawObject = (ctx, obj, state, time = 0) => {
         return;
     }
 
+    // Бігучий рядок (титри): з'являється за obj.startBeforeEnd секунд до кінця
+    // слайда і рівно за цей час пролітає текст справа наліво (як стрічка новин)
+    if (obj.type === 'ticker') {
+        const slideDur = obj.__slideDur || 0;
+        const startAt = Math.max(0, slideDur - (obj.startBeforeEnd != null ? obj.startBeforeEnd : 5));
+        const runTime = Math.max(slideDur - startAt, 0.5);
+        if (time < startAt || slideDur <= 0) { ctx.restore(); return; }
+        const p = Math.min((time - startAt) / runTime, 1);
+        ctx.fillStyle = obj.fillColor || 'rgba(15, 23, 42, 0.85)';
+        ctx.fillRect(0, 0, obj.w, obj.h);
+        const fs = obj.fontSize || 32;
+        ctx.font = `bold ${fs}px ${PPT_FALLBACK_FONTS}`;
+        ctx.fillStyle = obj.color || '#ffffff';
+        ctx.textBaseline = 'middle';
+        ctx.textAlign = 'left';
+        const txt = obj.text || '';
+        const textW = ctx.measureText(txt).width;
+        // Рух: текст залітає з правого краю і повністю виходить за лівий
+        const x = obj.w - p * (obj.w + textW);
+        ctx.fillText(txt, x, obj.h / 2);
+        ctx.restore();
+        return;
+    }
+
     if (obj.type === 'audio') {
         const cx = obj.w / 2, cy = obj.h / 2;
         ctx.fillStyle = '#f43f5e';
@@ -3839,7 +3863,7 @@ const drawSlideFrame = (ctx, slide, time) => {
         ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
     }
     for (const obj of (slide.objects || [])) {
-        drawObject(ctx, obj, getObjectRenderState(obj, time), time);
+        drawObject(ctx, obj.type === 'ticker' ? { ...obj, __slideDur: getSlideDuration(slide) } : obj, getObjectRenderState(obj, time), time);
     }
 };
 
@@ -5960,6 +5984,24 @@ export default function VideoEditor() {
 
     // --- Додавання власних об'єктів ---
 
+    // Бігучий рядок (титри в кінці слайда): типово на останній слайд,
+    // з'являється за 5с до кінця озвучки
+    const addTicker = () => {
+        if (!selectedSlide) return;
+        const object = {
+            id: crypto.randomUUID(), type: 'ticker',
+            x: 0, y: 630, w: 1280, h: 70,
+            text: 'Дякуємо за перегляд! 👋 Тут може бути ваш текст — змініть його в панелі праворуч.',
+            color: '#ffffff', fillColor: 'rgba(15, 23, 42, 0.85)', fontSize: 32,
+            startBeforeEnd: 5,
+            animation: { type: 'none', delay: 0, duration: 0.5 }
+        };
+        dispatchVideo({ type: 'ADD_OBJECT', slideId: selectedSlide.id, object });
+        setSelectedObjectId(object.id);
+        toast('info', 'Бігучий рядок додано: з\'явиться за 5с до кінця озвучки слайда (налаштуйте в панелі)');
+        logChange('Об\'єкт', `Додано бігучий рядок на слайд ${selectedSlide.slideNumber}`);
+    };
+
     const addTextObject = () => {
         if (!selectedSlide) return;
         const object = {
@@ -6787,6 +6829,7 @@ export default function VideoEditor() {
         if (obj.type === 'video') return 'Відео';
         if (obj.type === 'table') return 'Таблиця';
         if (obj.type === 'math') return 'Формула';
+        if (obj.type === 'ticker') return 'Бігучий рядок';
         if (obj.type === 'interactive') return (H5P_TYPES.find(t => t[0] === obj.iType) || [null, 'Інтерактив'])[1];
         return `Фігура (${obj.shapeKind})`;
     };
@@ -6866,6 +6909,24 @@ export default function VideoEditor() {
                 );
             }
             return videoEl({ width: '100%', height: '100%', objectFit: 'contain', borderRadius: radius || undefined });
+        }
+
+        if (obj.type === 'ticker') {
+            return (
+                <div
+                    className="w-full h-full flex items-center overflow-hidden"
+                    style={{
+                        backgroundColor: obj.fillColor || 'rgba(15, 23, 42, 0.85)',
+                        color: obj.color || '#fff',
+                        fontWeight: 700,
+                        fontSize: Math.max((obj.fontSize || 32) * scale, 8),
+                        whiteSpace: 'nowrap'
+                    }}
+                    title={`Бігучий рядок: з'явиться за ${obj.startBeforeEnd != null ? obj.startBeforeEnd : 5}с до кінця озвучки`}
+                >
+                    <span style={{ paddingLeft: 12 }}>🏃 {obj.text || 'Бігучий рядок'}</span>
+                </div>
+            );
         }
 
         if (obj.type === 'math') {
@@ -7271,6 +7332,45 @@ export default function VideoEditor() {
                         </div>
                     )}
 
+                    {/* Налаштування бігучого рядка */}
+                    {obj.type === 'ticker' && (
+                        <div className="space-y-2 border-t border-[#F0EEE6] pt-3">
+                            <span className="text-[10px] font-bold text-slate-400 uppercase">🏃 Бігучий рядок</span>
+                            <textarea
+                                value={obj.text || ''}
+                                onChange={(e) => updateObj({ text: e.target.value })}
+                                placeholder="Текст, що пролетить стрічкою"
+                                className="w-full min-h-[56px] p-2 text-xs border border-slate-200 rounded-lg outline-none focus:border-indigo-400 resize-y bg-white"
+                            />
+                            <label className="flex items-center gap-2 text-[11px] font-semibold text-slate-500">
+                                З'явитись за
+                                <input
+                                    type="number" step="0.5" min="1" max="60"
+                                    value={obj.startBeforeEnd != null ? obj.startBeforeEnd : 5}
+                                    onChange={(e) => updateObj({ startBeforeEnd: Math.max(1, Math.min(parseFloat(e.target.value) || 5, 60)) })}
+                                    className="w-16 px-1.5 py-1 text-xs border border-slate-200 rounded-lg outline-none focus:border-indigo-400 bg-white"
+                                    title="За скільки секунд до КІНЦЯ озвучки слайда з'явиться стрічка; за цей самий час текст повністю пролетить"
+                                />
+                                <span className="text-slate-300 text-[10px]">с до кінця озвучки</span>
+                            </label>
+                            <div className="grid grid-cols-3 gap-2">
+                                <label className="flex flex-col gap-0.5 text-[10px] font-bold text-slate-400">
+                                    Текст
+                                    <input type="color" value={obj.color || '#ffffff'} onChange={(e) => updateObj({ color: e.target.value })} className="w-full h-7 border border-slate-200 rounded cursor-pointer" />
+                                </label>
+                                <label className="flex flex-col gap-0.5 text-[10px] font-bold text-slate-400">
+                                    Стрічка
+                                    <input type="color" value={/^#/.test(obj.fillColor || '') ? obj.fillColor : '#0f172a'} onChange={(e) => updateObj({ fillColor: e.target.value })} className="w-full h-7 border border-slate-200 rounded cursor-pointer" />
+                                </label>
+                                <label className="flex flex-col gap-0.5 text-[10px] font-bold text-slate-400">
+                                    Кегль
+                                    <input type="number" min="14" max="72" value={obj.fontSize || 32} onChange={(e) => updateObj({ fontSize: Math.max(14, Math.min(parseInt(e.target.value, 10) || 32, 72)) })} className="w-full px-1.5 py-1 text-xs border border-slate-200 rounded-lg outline-none focus:border-indigo-400 bg-white" />
+                                </label>
+                            </div>
+                            <p className="text-[9px] text-slate-400">Стрічка видима лише у прев'ю та готовому відео — час появи рахується від тривалості озвучки слайда.</p>
+                        </div>
+                    )}
+
                     {/* Текстовий вміст */}
                     {obj.type === 'text' && (
                         <div className="space-y-2">
@@ -7654,6 +7754,14 @@ export default function VideoEditor() {
                         title="Прибрати анімації появи та зникнення з УСІХ об'єктів слайда — все видно одразу"
                     >
                         ∅ Без анімацій (весь слайд)
+                    </button>
+                    {/* Бігучий рядок — титри, що пролітають наприкінці слайда */}
+                    <button
+                        onClick={addTicker}
+                        className="w-full px-2 py-1.5 bg-slate-50 text-slate-600 hover:bg-violet-50 hover:text-[#7c3aed] rounded-xl text-[11px] font-bold transition-colors"
+                        title="Стрічка тексту, що з'являється за N секунд до кінця озвучки і пролітає справа наліво (типово — для останнього слайда)"
+                    >
+                        🏃 Додати бігучий рядок
                     </button>
                 </div>
 
