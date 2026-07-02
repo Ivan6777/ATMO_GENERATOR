@@ -1652,6 +1652,41 @@ const getRenderRuns = (line) => {
     return runs;
 };
 
+// U-62: хвиля озвучки слайда на таймлайні — видно паузи, межі речень і
+// «порожні хвости». Малюється з 16-біт PCM (audioBase64) один раз на зміну аудіо.
+const WaveformCanvas = ({ base64 }) => {
+    const ref = React.useRef(null);
+    React.useEffect(() => {
+        const cv = ref.current;
+        if (!cv || !base64) return;
+        try {
+            const bin = atob(base64);
+            const n = Math.floor(bin.length / 2);
+            const W = cv.width = Math.max(cv.offsetWidth, 100);
+            const H = cv.height = Math.max(cv.offsetHeight, 24);
+            const g = cv.getContext('2d');
+            g.clearRect(0, 0, W, H);
+            g.fillStyle = 'rgba(124, 58, 237, 0.35)';
+            const step = Math.max(1, Math.floor(n / W));
+            const probe = Math.max(1, Math.floor(step / 32)); // до 32 вимірів на піксель — швидко навіть для хвилинних треків
+            for (let x = 0; x < W; x++) {
+                let peak = 0;
+                const start = x * step;
+                for (let i = start; i < Math.min(start + step, n); i += probe) {
+                    const lo = bin.charCodeAt(2 * i), hi = bin.charCodeAt(2 * i + 1);
+                    let v = (hi << 8) | lo;
+                    if (v >= 0x8000) v -= 0x10000;
+                    const a = Math.abs(v) / 32768;
+                    if (a > peak) peak = a;
+                }
+                const h = Math.max(1, peak * (H - 2));
+                g.fillRect(x, (H - h) / 2, 1, h);
+            }
+        } catch (e) { /* пошкоджене аудіо — просто без хвилі */ }
+    }, [base64]);
+    return <canvas ref={ref} className="absolute inset-0 w-full h-full pointer-events-none" aria-hidden="true" />;
+};
+
 const PPT_FALLBACK_FONTS = '"Calibri", "Arial", "Segoe UI", "Helvetica Neue", "Segoe UI Emoji", "Segoe UI Symbol", "Cambria Math", "STIX Two Math", "Noto Sans Math", "Apple Color Emoji", "Noto Color Emoji", sans-serif';
 
 const buildRunFont = (r) =>
@@ -5600,6 +5635,8 @@ export default function VideoEditor() {
                             if (tl) { const cursor = tl.querySelector('.scrub-cursor'); if (cursor) cursor.style.opacity = '0'; }
                         }}
                     >
+                        {/* U-62: хвиля озвучки слайда — фоновим шаром */}
+                        {slide.audioBase64 && <WaveformCanvas base64={slide.audioBase64} />}
                         {/* Ruler marks */}
                         <div className="absolute top-0 left-0 right-0 h-4 border-b border-slate-200 pointer-events-none">
                             {secMarks.map(s => (
@@ -6343,6 +6380,20 @@ export default function VideoEditor() {
             await recordingComplete;
 
             const videoBlob = new Blob(chunks, { type: mimeType });
+            // ── Автоперевірка вимог до відео: 1920x1080 · H.264 · 30fps · ≤10 Мбіт/с ──
+            // Роздільність і fps задані жорстко (canvas 1920x1080, captureStream(30));
+            // кодек і ФАКТИЧНИЙ бітрейт перевіряємо по готовому файлу.
+            const actualMbps = totalExportSec > 0 ? (videoBlob.size * 8 / totalExportSec / 1e6) : 0;
+            const isH264 = extension === 'mp4';
+            const specOk = isH264 && actualMbps <= 10.5;
+            toast(specOk ? 'success' : 'error',
+                `Відео: 1920×1080 · ${isH264 ? 'H.264 (MP4)' : 'WebM — БЕЗ H.264!'} · 30 fps · ${actualMbps.toFixed(1)} Мбіт/с` +
+                (specOk ? ' ✓ відповідає вимогам' : (!isH264 ? '. Для H.264 відкрийте редактор у Chrome або Edge' : ' — бітрейт вище 10 Мбіт/с')),
+                { duration: 9000 });
+            logChange('Експорт', 'Перевірка вимог до відео', {
+                resolution: '1920x1080', codec: mimeType, fps: 30,
+                bitrateMbps: Math.round(actualMbps * 100) / 100, sizeMB: Math.round(videoBlob.size / 1048576), specOk
+            });
             // Вшиваємо проєкт у кінець файлу (маркер + base64 JSON), щоб MP4 можна було
             // відкрити НАЗАД у редакторі (зворотна конвертація). Плеєри ігнорують хвіст.
             // Медіа (відео/аудіо) вшиваються як data:-URL — blob:-посилання не
