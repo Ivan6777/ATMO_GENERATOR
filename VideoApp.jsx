@@ -1,4 +1,4 @@
-import React, { useState, useReducer, useRef, useEffect, useCallback } from 'react';
+import React, { useState, useReducer, useRef, useEffect, useCallback, useMemo } from 'react';
 
 /* ============================================================================
  * 0. UXKit — UI/UX-примітиви (Спринти 1–2 з UX_UPDATES_CHECKLIST.md)
@@ -172,7 +172,7 @@ const idbReq = (db, store, mode, fn) => new Promise((resolve, reject) => {
 // перечитуються з пам'яті при кожному автозбереженні
 const __savedMediaKeys = new Map();
 
-const saveProjectSnapshot = async (slides) => {
+const saveProjectSnapshot = async (slides, extra = null) => {
     const db = await openDb();
     const serializable = [];
     for (const s of slides) {
@@ -195,7 +195,7 @@ const saveProjectSnapshot = async (slides) => {
         }
         serializable.push({ ...s, objects, isGenerating: false });
     }
-    await idbReq(db, 'project', 'readwrite', st => st.put({ savedAt: Date.now(), slides: serializable }, 'autosave'));
+    await idbReq(db, 'project', 'readwrite', st => st.put({ savedAt: Date.now(), slides: serializable, ...(extra || {}) }, 'autosave'));
 };
 
 const loadProjectSnapshot = async () => {
@@ -216,7 +216,7 @@ const loadProjectSnapshot = async () => {
             }
             slides.push({ ...s, objects });
         }
-        return { slides, savedAt: snap.savedAt };
+        return { slides, savedAt: snap.savedAt, cover: snap.cover || null, subtitles: snap.subtitles || null };
     } catch (e) {
         return null;
     }
@@ -233,7 +233,7 @@ const clearProjectSnapshot = async () => {
 
 // U-01/U-04. Дебаунс-автозбереження; повертає стан для індикатора в топбарі
 // та dirtyRef для beforeunload-запобіжника
-const useAutosave = (slides, enabled = true) => {
+const useAutosave = (slides, enabled = true, extra = null) => {
     const [state, setState] = React.useState({ status: 'idle', savedAt: null });
     const timerRef = React.useRef(null);
     const busyRef = React.useRef(false);
@@ -248,7 +248,7 @@ const useAutosave = (slides, enabled = true) => {
             busyRef.current = true;
             setState(s => ({ ...s, status: 'saving' }));
             try {
-                await saveProjectSnapshot(slides);
+                await saveProjectSnapshot(slides, extra);
                 dirtyRef.current = false;
                 setState({ status: 'saved', savedAt: Date.now() });
             } catch (e) {
@@ -258,7 +258,7 @@ const useAutosave = (slides, enabled = true) => {
             }
         }, 2500);
         return () => clearTimeout(timerRef.current);
-    }, [slides, enabled]);
+    }, [slides, enabled, extra]);
     return { ...state, dirtyRef };
 };
 
@@ -864,6 +864,9 @@ const restartAudioEngine = () => {
 // Внутрішня система координат слайду (повне HD 16:9)
 const CANVAS_W = 1280;
 const CANVAS_H = 720;
+// Тривалість показу прев'ю-обкладинки на початку експортованого відео (с):
+// достатньо, щоб плеєри/LMS взяли її як мініатюру, і не затягує перегляд
+const COVER_INTRO_SEC = 1;
 
 // Повний набір переходів між слайдами у стилі PowerPoint
 const TRANSITIONS = {
@@ -3952,6 +3955,87 @@ const drawObject = (ctx, obj, state, time = 0) => {
 };
 
 // Малює повний кадр слайду у момент часу time (сек від початку слайду)
+// ─── Субтитри у відео: репліки з тексту диктора, вшиваються прямо в кадр ───
+// Налаштування — модульний об'єкт (як imageCache): його читають усі шляхи
+// малювання (прев'ю, скраб, обидва експорти), а редактор синхронізує зі станом.
+const SUBTITLE_SETTINGS = { enabled: false, size: 'medium' };
+const SUBTITLE_FONT_PX = { small: 24, medium: 30, large: 38 };
+const __subtitleCueCache = new Map();
+// Прибирає з тексту диктора службові маркери ([ПАУЗА], [1]/[2]) — у субтитри
+// має потрапляти лише те, що реально звучить.
+const stripNarrationMarkup = (text) => (text || '')
+    .replace(/\[(?:ПАУЗА|PAUSE)(?::[\d.]+)?\]/gi, ' ')
+    .replace(/\[[12]\]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+// Розбиває текст диктора на репліки й розподіляє їх за часом озвучки слайда
+// пропорційно довжині (точних таймкодів TTS не віддає). Без озвучки —
+// оцінка ~2.5 слова/с, як у решті коду.
+const getSubtitleCues = (slide) => {
+    const clean = stripNarrationMarkup(slide.text);
+    if (!clean) return [];
+    const speech = (slide.audioBase64 && slide.audioDuration > 0)
+        ? slide.audioDuration
+        : Math.min(getSlideDuration(slide), Math.max(2, clean.split(/\s+/).length / 2.5));
+    const key = slide.id + '|' + clean + '|' + speech.toFixed(2);
+    if (__subtitleCueCache.has(key)) return __subtitleCueCache.get(key);
+    const sentences = clean.split(/(?<=[.!?…])\s+/);
+    const MAX_CUE = 84; // символів у репліці — комфортно читається за свій час
+    const chunks = [];
+    for (const s of sentences) {
+        if (s.length <= MAX_CUE) { if (s) chunks.push(s); continue; }
+        let cur = '';
+        for (const w of s.split(' ')) {
+            if (cur && (cur + ' ' + w).length > MAX_CUE) { chunks.push(cur); cur = w; }
+            else cur = cur ? cur + ' ' + w : w;
+        }
+        if (cur) chunks.push(cur);
+    }
+    const totalChars = chunks.reduce((a, c) => a + c.length, 0) || 1;
+    let at = 0;
+    const cues = chunks.map(c => {
+        const dur = speech * (c.length / totalChars);
+        const cue = { text: c, start: at, end: at + dur };
+        at += dur;
+        return cue;
+    });
+    if (__subtitleCueCache.size > 400) __subtitleCueCache.clear();
+    __subtitleCueCache.set(key, cues);
+    return cues;
+};
+const drawSubtitles = (ctx, slide, time) => {
+    const cue = getSubtitleCues(slide).find(c => time >= c.start && time < c.end);
+    if (!cue) return;
+    const fontPx = SUBTITLE_FONT_PX[SUBTITLE_SETTINGS.size] || SUBTITLE_FONT_PX.medium;
+    ctx.save();
+    ctx.font = `600 ${fontPx}px 'Segoe UI', Arial, sans-serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    const maxW = CANVAS_W - 240;
+    const lines = [];
+    let cur = '';
+    for (const w of cue.text.split(' ')) {
+        const probe = cur ? cur + ' ' + w : w;
+        if (cur && ctx.measureText(probe).width > maxW) { lines.push(cur); cur = w; }
+        else cur = probe;
+    }
+    if (cur) lines.push(cur);
+    const lineH = Math.round(fontPx * 1.3);
+    const padX = 22, padY = 12;
+    const boxW = Math.min(maxW + padX * 2, Math.max(...lines.map(l => ctx.measureText(l).width)) + padX * 2);
+    const boxH = lines.length * lineH + padY * 2;
+    const cx = CANVAS_W / 2;
+    const boxY = CANVAS_H - 28 - boxH;
+    ctx.fillStyle = 'rgba(15, 23, 42, 0.72)';
+    ctx.beginPath();
+    if (ctx.roundRect) ctx.roundRect(cx - boxW / 2, boxY, boxW, boxH, 10);
+    else ctx.rect(cx - boxW / 2, boxY, boxW, boxH);
+    ctx.fill();
+    ctx.fillStyle = '#ffffff';
+    lines.forEach((l, i) => ctx.fillText(l, cx, boxY + padY + i * lineH + lineH / 2));
+    ctx.restore();
+};
+
 const drawSlideFrame = (ctx, slide, time) => {
     ctx.globalAlpha = 1;
     const bgImg = slide.bgImage ? imageCache.get(slide.bgImage) : null;
@@ -3967,6 +4051,7 @@ const drawSlideFrame = (ctx, slide, time) => {
     for (const obj of (slide.objects || [])) {
         drawObject(ctx, obj.type === 'ticker' ? { ...obj, __slideDur: getSlideDuration(slide) } : obj, getObjectRenderState(obj, time), time);
     }
+    if (SUBTITLE_SETTINGS.enabled && slide.text) drawSubtitles(ctx, slide, time);
 };
 
 // Рендерить слайд у офскрін-канвас (для кадрів переходу)
@@ -4632,7 +4717,23 @@ export default function VideoEditor() {
     const [importProgress, setImportProgress] = useState(null);     // { stage, current, total } | null (U-19)
     const [shortcutsOpen, setShortcutsOpen] = useState(false);      // модал гарячих клавіш (U-72)
     const [restoreSnapshot, setRestoreSnapshot] = useState(null);   // збережена сесія для банера (U-02)
-    const autosave = useAutosave(slides);                           // IndexedDB, дебаунс 2.5с (U-01/U-04)
+    // Прев'ю-обкладинка відео (dataURL 1280x720 JPEG) — перший кадр експорту,
+    // її ж плеєри/LMS показують як мініатюру файлу
+    const [coverImage, setCoverImage] = useState(null);
+    // Субтитри у відео: вшиті репліки з тексту диктора внизу кадру
+    const [subtitlesOn, setSubtitlesOn] = useState(() => { try { return localStorage.getItem('subtitles_on') === '1'; } catch (e) { return false; } });
+    const [subtitleSize, setSubtitleSize] = useState(() => { try { return localStorage.getItem('subtitles_size') || 'medium'; } catch (e) { return 'medium'; } });
+    useEffect(() => {
+        SUBTITLE_SETTINGS.enabled = subtitlesOn;
+        SUBTITLE_SETTINGS.size = subtitleSize;
+        try { localStorage.setItem('subtitles_on', subtitlesOn ? '1' : '0'); localStorage.setItem('subtitles_size', subtitleSize); } catch (e) { /* приватний режим */ }
+    }, [subtitlesOn, subtitleSize]);
+    // Обкладинка й субтитри — частина проєкту: їдуть в автозбереження разом зі слайдами
+    const autosaveExtra = useMemo(() => ({
+        cover: coverImage,
+        subtitles: { enabled: subtitlesOn, size: subtitleSize }
+    }), [coverImage, subtitlesOn, subtitleSize]);
+    const autosave = useAutosave(slides, true, autosaveExtra);      // IndexedDB, дебаунс 2.5с (U-01/U-04)
     const autosaveDirtyRef = autosave.dirtyRef;
     const shouldWarnBeforeUnload = useCallback(
         () => autosaveDirtyRef.current === true,
@@ -4648,6 +4749,11 @@ export default function VideoEditor() {
         if (!restoreSnapshot) return;
         dispatchVideo({ type: 'SET_SLIDES', slides: restoreSnapshot.slides });
         setSelectedSlideId(restoreSnapshot.slides[0]?.id || null);
+        setCoverImage(restoreSnapshot.cover || null);
+        if (restoreSnapshot.subtitles) {
+            setSubtitlesOn(!!restoreSnapshot.subtitles.enabled);
+            setSubtitleSize(restoreSnapshot.subtitles.size || 'medium');
+        }
         setSelectedObjectId(null);
         setRestoreSnapshot(null);
         toast('success', `Сесію відновлено: ${restoreSnapshot.slides.length} слайд(ів)`);
@@ -4841,7 +4947,12 @@ export default function VideoEditor() {
     const saveProjectToFile = async () => {
         if (!slides.length) return;
         try {
-            const data = { studioProVideo: 2, exportedAt: Date.now(), slides: await serializeSlidesForEmbed(slides) };
+            const data = {
+                studioProVideo: 2, exportedAt: Date.now(),
+                slides: await serializeSlidesForEmbed(slides),
+                cover: coverImage,
+                subtitles: { enabled: subtitlesOn, size: subtitleSize }
+            };
             const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
@@ -4861,10 +4972,50 @@ export default function VideoEditor() {
             dispatchVideo({ type: 'SET_SLIDES', slides: revived });
             setSelectedSlideId(revived[0]?.id || null);
             setSelectedObjectId(null);
+            setCoverImage(data.cover || null);
+            if (data.subtitles) {
+                setSubtitlesOn(!!data.subtitles.enabled);
+                setSubtitleSize(data.subtitles.size || 'medium');
+            }
             if (deadMedia > 0) toast('error', `Не відновлено медіа: ${deadMedia} (файл зі старої версії)`);
             toast('success', `Проєкт відкрито: ${revived.length} слайд(ів)`);
             logChange('Проєкт', `Відкрито файл .atmo: "${file.name}"`, { slides: revived.length });
         } catch (e) { toast('error', 'Не вдалося відкрити .atmo: ' + e.message); }
+    };
+
+    // Прев'ю-обкладинка відео: викладач завантажує картинку, вона стає першим
+    // кадром експортованого MP4 (саме перший кадр плеєри та LMS показують як
+    // мініатюру). Стискаємо до кадру 1280x720 JPEG, щоб знімок проєкту
+    // (.atmo / вшивка в MP4 / автозбереження) не роздувався від фото з камери.
+    const uploadCoverImage = () => {
+        const fileIn = document.createElement('input');
+        fileIn.type = 'file';
+        fileIn.accept = 'image/*';
+        fileIn.onchange = async (ev) => {
+            const file = ev.target.files[0];
+            if (!file) return;
+            try {
+                const url = URL.createObjectURL(file);
+                const img = await loadImage(url);
+                URL.revokeObjectURL(url);
+                if (!img) throw new Error('браузер не декодує це зображення');
+                const c = document.createElement('canvas');
+                c.width = CANVAS_W;
+                c.height = CANVAS_H;
+                const cctx = c.getContext('2d');
+                const scale = Math.max(CANVAS_W / img.width, CANVAS_H / img.height);
+                const w = img.width * scale, h = img.height * scale;
+                cctx.fillStyle = '#000000';
+                cctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+                cctx.drawImage(img, (CANVAS_W - w) / 2, (CANVAS_H - h) / 2, w, h);
+                setCoverImage(c.toDataURL('image/jpeg', 0.85));
+                toast('success', 'Прев\'ю додано — воно стане першим кадром відео');
+                logChange('Проєкт', 'Додано прев\'ю-обкладинку', { file: file.name });
+            } catch (e) {
+                toast('error', 'Не вдалося прочитати зображення: ' + (e.message || e));
+            }
+        };
+        fileIn.click();
     };
 
     const [pauseSeconds, setPauseSeconds] = useState(1);             // тривалість паузи (сек), яку вставляє кнопка [ПАУЗА]
@@ -5093,6 +5244,7 @@ export default function VideoEditor() {
             setSelectedSlideId(extracted[0]?.id || null);
             setSelectedObjectId(null);
             setRestoreSnapshot(null); // імпортовано новий проєкт — банер відновлення більше не актуальний
+            setCoverImage(null);      // обкладинка попереднього проєкту не стосується нового
             toast('success', `Імпортовано «${file.name}»: ${extracted.length} слайд(ів)`);
             logChange('Імпорт', `Завантажено файл "${file.name}"`, { slides: extracted.length });
         } catch (err) {
@@ -6590,6 +6742,7 @@ export default function VideoEditor() {
     const startFullPreview = async () => {
         if (slides.length === 0 || isPreviewing) return;
         for (const s of slides) await preloadSlideImages(s);
+        const coverImg = coverImage ? await loadImage(coverImage) : null;
         setIsPreviewing(true);
 
         setTimeout(() => {
@@ -6597,8 +6750,9 @@ export default function VideoEditor() {
             if (!canvas) { setIsPreviewing(false); return; }
             const ctx = canvas.getContext('2d');
 
-            // Розклад відтворення: [перехід] -> слайд -> [перехід] -> слайд -> ...
+            // Розклад відтворення: [обкладинка] -> [перехід] -> слайд -> ...
             const segments = [];
+            if (coverImg) segments.push({ kind: 'cover', dur: COVER_INTRO_SEC });
             let prev = null;
             for (const s of slides) {
                 const tDur = getTransitionDuration(s);
@@ -6628,6 +6782,7 @@ export default function VideoEditor() {
                 segIdx = i;
                 segStartMs = nowMs;
                 const seg = segments[i];
+                if (seg.kind === 'cover') return; // статична картинка без звуку
                 if (seg.kind === 'transition') {
                     // Кадри переходу: фінальний стан попереднього слайду -> стартовий нового
                     seg.prevCanvas = renderSlideToCanvas(seg.prev, getSlideDuration(seg.prev) + 10);
@@ -6658,7 +6813,9 @@ export default function VideoEditor() {
                     t = (now - segStartMs) / 1000;
                 }
                 const seg = segments[segIdx];
-                if (seg.kind === 'transition') {
+                if (seg.kind === 'cover') {
+                    ctx.drawImage(coverImg, 0, 0, CANVAS_W, CANVAS_H);
+                } else if (seg.kind === 'transition') {
                     drawTransitionFrame(ctx, seg.prevCanvas, seg.nextCanvas, seg.type, t / seg.dur);
                 } else {
                     drawSlideFrame(ctx, seg.slide, t);
@@ -6783,10 +6940,12 @@ export default function VideoEditor() {
         try {
             const Mp4Muxer = await loadMp4Muxer();
             for (const slide of slides) await preloadSlideImages(slide);
+            const coverImg = coverImage ? await loadImage(coverImage) : null;
 
-            // Розклад: [перехід] -> слайд -> ... (як у прев'ю), час старту кожного слайда
+            // Розклад: [обкладинка] -> [перехід] -> слайд -> ... (як у прев'ю)
             const segments = [];
             let cursor = 0;
+            if (coverImg) { segments.push({ kind: 'cover', start: 0, dur: COVER_INTRO_SEC }); cursor = COVER_INTRO_SEC; }
             slides.forEach((sl, i) => {
                 const tDur = i > 0 ? getTransitionDuration(sl) : 0;
                 if (tDur > 0) { segments.push({ kind: 'transition', prev: slides[i - 1], slide: sl, start: cursor, dur: tDur }); cursor += tDur; }
@@ -6893,7 +7052,9 @@ export default function VideoEditor() {
                 while (segIdx < segments.length - 1 && t >= segments[segIdx].start + segments[segIdx].dur) segIdx++;
                 const seg = segments[segIdx];
                 const local = Math.min(t - seg.start, seg.dur);
-                if (seg.kind === 'transition') {
+                if (seg.kind === 'cover') {
+                    ctx.drawImage(coverImg, 0, 0, CANVAS_W, CANVAS_H);
+                } else if (seg.kind === 'transition') {
                     const prevCanvas = renderSlideToCanvas(seg.prev, getSlideDuration(seg.prev) + 10);
                     const nextCanvas = renderSlideToCanvas(seg.slide, 0);
                     drawTransitionFrame(ctx, prevCanvas, nextCanvas, seg.slide.transition, local / seg.dur);
@@ -6935,7 +7096,7 @@ export default function VideoEditor() {
             // Вшиваємо проєкт (як у звичайному експорті) і віддаємо файл
             let finalBlob = videoBlob;
             try {
-                const snapshot = { studioProVideo: 2, exportedAt: Date.now(), slides: await serializeSlidesForEmbed(slides) };
+                const snapshot = { studioProVideo: 2, exportedAt: Date.now(), slides: await serializeSlidesForEmbed(slides), cover: coverImage, subtitles: { enabled: subtitlesOn, size: subtitleSize } };
                 const b64 = btoa(unescape(encodeURIComponent(JSON.stringify(snapshot))));
                 finalBlob = new Blob([videoBlob, `\n${VIDEO_PROJECT_START}\n${b64}\n${VIDEO_PROJECT_END}\n`], { type: 'video/mp4' });
             } catch (e) { /* завеликий проєкт — чисте відео */ }
@@ -7058,9 +7219,18 @@ export default function VideoEditor() {
                 }
             };
 
-            // U-23: повна тривалість майбутнього відео (слайди + переходи) для ETA
+            // Прев'ю-обкладинка — найперші кадри запису (стане мініатюрою файлу)
+            const coverImg = coverImage ? await loadImage(coverImage) : null;
+
+            // U-23: повна тривалість майбутнього відео (обкладинка + слайди + переходи) для ETA
             const totalExportSec = slides.reduce((acc, sl, k) =>
-                acc + getSlideDuration(sl) + (k > 0 ? getTransitionDuration(sl) : 0), 0);
+                acc + getSlideDuration(sl) + (k > 0 ? getTransitionDuration(sl) : 0), coverImg ? COVER_INTRO_SEC : 0);
+
+            if (coverImg) {
+                await drawTimed(COVER_INTRO_SEC, () => {
+                    ctx.drawImage(coverImg, 0, 0, CANVAS_W, CANVAS_H);
+                });
+            }
 
             let prevSlide = null;
 
@@ -7153,7 +7323,7 @@ export default function VideoEditor() {
             // переживають перезавантаження сторінки.
             let finalBlob = videoBlob;
             try {
-                const snapshot = { studioProVideo: 2, exportedAt: Date.now(), slides: await serializeSlidesForEmbed(slides) };
+                const snapshot = { studioProVideo: 2, exportedAt: Date.now(), slides: await serializeSlidesForEmbed(slides), cover: coverImage, subtitles: { enabled: subtitlesOn, size: subtitleSize } };
                 const b64 = btoa(unescape(encodeURIComponent(JSON.stringify(snapshot))));
                 finalBlob = new Blob([videoBlob, `\n${VIDEO_PROJECT_START}\n${b64}\n${VIDEO_PROJECT_END}\n`], { type: mimeType });
             } catch (e) {
@@ -7289,6 +7459,11 @@ export default function VideoEditor() {
             dispatchVideo({ type: 'SET_SLIDES', slides: revivedSlides });
             setSelectedSlideId(revivedSlides[0]?.id || null);
             setSelectedObjectId(null);
+            setCoverImage(snapshot.cover || null);
+            if (snapshot.subtitles) {
+                setSubtitlesOn(!!snapshot.subtitles.enabled);
+                setSubtitleSize(snapshot.subtitles.size || 'medium');
+            }
             if (deadMedia > 0) {
                 toast('error', `Не вдалося відновити ${deadMedia} відео/аудіо: файл експортовано старішою версією редактора. Переекспортуйте проєкт із поточної версії.`, { duration: 9000 });
             }
@@ -8659,6 +8834,34 @@ export default function VideoEditor() {
                             {scenesCollapsed ? '»' : '«'}
                         </button>
                         {!scenesCollapsed && <>
+                        {/* Прев'ю-обкладинка відео: перший кадр експорту = мініатюра файлу */}
+                        <div className="mx-2 mt-2 mb-1 p-1.5 rounded-lg border border-slate-200 bg-slate-50">
+                            <div className="text-[9px] font-bold text-slate-400 uppercase tracking-wide mb-1 px-0.5">Прев'ю відео</div>
+                            {coverImage ? (
+                                <div className="relative group/cover">
+                                    <img
+                                        src={coverImage}
+                                        alt="Прев'ю відео"
+                                        className="w-full rounded-md border border-slate-200 cursor-pointer"
+                                        style={{ aspectRatio: '16/9', objectFit: 'cover' }}
+                                        onClick={uploadCoverImage}
+                                        title="Ця картинка стане першим кадром відео (мініатюрою). Клік — замінити"
+                                    />
+                                    <button
+                                        onClick={() => { setCoverImage(null); toast('info', 'Прев\'ю прибрано'); }}
+                                        className="absolute -top-1.5 -right-1.5 w-4 h-4 rounded-full bg-slate-600 hover:bg-red-500 text-white text-[9px] leading-none items-center justify-center hidden group-hover/cover:flex"
+                                        title="Прибрати прев'ю"
+                                        aria-label="Прибрати прев'ю"
+                                    >✕</button>
+                                </div>
+                            ) : (
+                                <button
+                                    onClick={uploadCoverImage}
+                                    className="w-full px-2 py-2 text-[10px] font-semibold text-slate-500 border border-dashed border-slate-300 hover:border-[#7c3aed] hover:text-[#7c3aed] rounded-md transition-colors"
+                                    title="Картинка-обкладинка: стане першим кадром експортованого відео — саме її плеєри показують як мініатюру"
+                                >🖼 Завантажити картинку</button>
+                            )}
+                        </div>
                         <button
                             onClick={() => {
                                 const fileIn = document.createElement('input');
@@ -8900,6 +9103,25 @@ export default function VideoEditor() {
                                                     isGenerating={isGeneratingAll}
                                                     onGenerateMissing={generateAllMissingSlidesAudio}
                                                 />
+                                                {/* Субтитри: вшиті репліки з тексту диктора внизу кадру */}
+                                                <div className="px-3 py-2 border-b border-slate-100 flex items-center justify-between gap-2">
+                                                    <label className="flex items-center gap-1.5 text-xs font-semibold text-slate-700 cursor-pointer" title="Текст диктора внизу кадру — вшивається у відео та видно у режимі «Грати»">
+                                                        <input type="checkbox" checked={subtitlesOn} onChange={e => setSubtitlesOn(e.target.checked)} />
+                                                        Субтитри у відео
+                                                    </label>
+                                                    {subtitlesOn && (
+                                                        <select
+                                                            value={subtitleSize}
+                                                            onChange={e => setSubtitleSize(e.target.value)}
+                                                            className="text-[10px] border border-slate-200 rounded px-1 py-0.5 text-slate-600"
+                                                            title="Розмір субтитрів"
+                                                        >
+                                                            <option value="small">Малі</option>
+                                                            <option value="medium">Середні</option>
+                                                            <option value="large">Великі</option>
+                                                        </select>
+                                                    )}
+                                                </div>
                                                 <div className="px-3 py-1.5 text-[10px] font-bold text-slate-400 uppercase tracking-wide bg-slate-50">Відео · 1920×1080 · H.264 · 30 fps · ~9 Мбіт/с</div>
                                                 <button onClick={() => { setExportMenuOpen(false); handleExportVideoFast({ withAudio: true }); }} className="w-full text-left px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-violet-50 flex items-center gap-2" title="Кодування через WebCodecs: у рази швидше реального часу; якщо браузер не підтримує — автоматично звичайний експорт">
                                                     <Zap size={14} className="text-amber-500" /> ⚡ MP4 швидкий (WebCodecs)
