@@ -6450,6 +6450,258 @@ export default function VideoEditor() {
     };
 
     // opts: { withAudio } — withAudio:false → відео без звуку
+    // ═══ ШВИДКИЙ ЕКСПОРТ (WebCodecs): кадри кодуються так швидко, як малюються —
+    // 5–10× швидше реального часу для слайдів без відео. Аудіо (озвучка + звук
+    // вбудованих відео) рендериться миттєво через OfflineAudioContext, кадри —
+    // VideoEncoder H.264, контейнер — mp4-muxer (вантажиться з CDN, як JSZip).
+    // Якщо браузер не підтримує WebCodecs/AAC — автоматичний фолбек на звичайний
+    // експорт у реальному часі (MediaRecorder). ═══
+    const loadMp4Muxer = () => new Promise((res, rej) => {
+        if (window.Mp4Muxer) return res(window.Mp4Muxer);
+        const sc = document.createElement('script');
+        sc.src = 'https://cdn.jsdelivr.net/npm/mp4-muxer@5.1.5/build/mp4-muxer.min.js';
+        sc.onload = () => res(window.Mp4Muxer);
+        sc.onerror = rej;
+        document.head.appendChild(sc);
+    });
+
+    // Точне позиціювання кадру вбудованих відео: сік до потрібної секунди
+    // (детермінований рендер замість відтворення в реальному часі)
+    const seekSlideVideosTo = async (slide, tLocal) => {
+        const vids = (slide.objects || []).filter(o => o.type === 'video' && o.src);
+        for (const o of vids) {
+            const v = videoCache.get(o.src);
+            if (!v || !(v.duration > 0)) continue;
+            const ts = o.trimStart || 0;
+            const te = (o.trimEnd != null && o.trimEnd > ts) ? o.trimEnd : v.duration;
+            const span = Math.max(te - ts, 0.1);
+            const local = tLocal - ((o.animation && o.animation.delay) || 0);
+            if (local < 0) continue;
+            const fit = o.videoFitMode || 'loop';
+            let target;
+            if (fit === 'stretch') target = ts + Math.min((local / Math.max(tLocal, 0.01)) * span, span);
+            else if (fit === 'trim') target = Math.min(ts + local, te - 0.03);
+            else target = ts + (local % span); // loop
+            target = Math.max(0, Math.min(target, v.duration - 0.03));
+            if (Math.abs(v.currentTime - target) < 0.02) continue;
+            await new Promise(resolve => {
+                let done = false;
+                const fin = () => { if (!done) { done = true; v.removeEventListener('seeked', fin); resolve(); } };
+                v.addEventListener('seeked', fin);
+                setTimeout(fin, 250);
+                try { v.currentTime = target; } catch (e) { fin(); }
+            });
+        }
+    };
+
+    const handleExportVideoFast = async (opts = {}) => {
+        if (slides.length === 0 || isVideoExportingRef.current) return;
+        const withAudio = (opts && opts.withAudio) !== false;
+
+        // Перевірка можливостей браузера; інакше — чесний фолбек на повільний шлях
+        let videoOk = false, audioOk = !withAudio;
+        try {
+            if (typeof window.VideoEncoder === 'function') {
+                videoOk = (await VideoEncoder.isConfigSupported({ codec: 'avc1.640028', width: 1920, height: 1080, bitrate: 9e6, framerate: 30 })).supported;
+            }
+            if (withAudio && typeof window.AudioEncoder === 'function') {
+                audioOk = (await AudioEncoder.isConfigSupported({ codec: 'mp4a.40.2', sampleRate: 48000, numberOfChannels: 2, bitrate: 192000 })).supported;
+            }
+        } catch (e) { /* нижче фолбек */ }
+        if (!videoOk || !audioOk) {
+            toast('info', 'Браузер не підтримує швидке кодування (WebCodecs H.264/AAC) — експортуємо звичайним способом');
+            return handleExportVideo(opts);
+        }
+
+        isVideoExportingRef.current = true;
+        stopPreview();
+        setIsExporting(true);
+        setExportProgress(0);
+        logChange('Експорт', 'Старт ШВИДКОГО експорту (WebCodecs) 1080p', { withAudio, slides: slides.length });
+        const fps = 30;
+        const exportStart = performance.now();
+        try {
+            const Mp4Muxer = await loadMp4Muxer();
+            for (const slide of slides) await preloadSlideImages(slide);
+
+            // Розклад: [перехід] -> слайд -> ... (як у прев'ю), час старту кожного слайда
+            const segments = [];
+            let cursor = 0;
+            slides.forEach((sl, i) => {
+                const tDur = i > 0 ? getTransitionDuration(sl) : 0;
+                if (tDur > 0) { segments.push({ kind: 'transition', prev: slides[i - 1], slide: sl, start: cursor, dur: tDur }); cursor += tDur; }
+                const dur = getSlideDuration(sl);
+                segments.push({ kind: 'slide', slide: sl, start: cursor, dur });
+                cursor += dur;
+            });
+            const totalSec = cursor;
+
+            // ── Аудіо: офлайн-мікс (миттєво, без відтворення) ──
+            let audioBuffer = null;
+            if (withAudio) {
+                const SR = 48000;
+                const off = new OfflineAudioContext(2, Math.max(1, Math.ceil(totalSec * SR)), SR);
+                for (const seg of segments) {
+                    if (seg.kind !== 'slide') continue;
+                    const sl = seg.slide;
+                    if (sl.audioBase64) { // озвучка (PCM -> буфер)
+                        try {
+                            const buf = base64ToAudioBuffer(off, sl.audioBase64, sl.sampleRate);
+                            const src = off.createBufferSource();
+                            src.buffer = buf; src.connect(off.destination); src.start(seg.start);
+                        } catch (e) { /* слайд без озвучки */ }
+                    }
+                    for (const o of (sl.objects || [])) { // звук вбудованих відео/аудіо
+                        if ((o.type !== 'video' && o.type !== 'audio') || !o.src) continue;
+                        try {
+                            const ab = await fetch(o.src).then(r => r.arrayBuffer());
+                            const clip = await off.decodeAudioData(ab.slice(0));
+                            const ts = o.trimStart || 0;
+                            const te = (o.trimEnd != null && o.trimEnd > ts) ? Math.min(o.trimEnd, clip.duration) : clip.duration;
+                            const span = Math.max(te - ts, 0.05);
+                            const delay = (o.animation && o.animation.delay) || 0;
+                            const avail = seg.dur - delay;
+                            if (avail <= 0) continue;
+                            const fit = o.videoFitMode || 'loop';
+                            if (fit === 'loop' && o.type === 'video') {
+                                let at = 0;
+                                while (at < avail - 0.05) {
+                                    const src = off.createBufferSource();
+                                    src.buffer = clip; src.connect(off.destination);
+                                    src.start(seg.start + delay + at, ts, Math.min(span, avail - at));
+                                    at += span;
+                                }
+                            } else {
+                                const src = off.createBufferSource();
+                                src.buffer = clip; src.connect(off.destination);
+                                if (fit === 'stretch' && o.type === 'video') src.playbackRate.value = Math.max(0.05, span / avail);
+                                src.start(seg.start + delay, ts, Math.min(fit === 'stretch' ? span / Math.max(span / avail, 0.05) : span, avail));
+                            }
+                        } catch (e) { /* кліп без аудіодоріжки */ }
+                    }
+                }
+                audioBuffer = await off.startRendering();
+            }
+
+            // ── Мультиплексор і кодери ──
+            const muxer = new Mp4Muxer.Muxer({
+                target: new Mp4Muxer.ArrayBufferTarget(),
+                video: { codec: 'avc', width: 1920, height: 1080 },
+                audio: withAudio ? { codec: 'aac', sampleRate: 48000, numberOfChannels: 2 } : undefined,
+                fastStart: 'in-memory'
+            });
+            let codecErr = null;
+            const vEnc = new VideoEncoder({
+                output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
+                error: (e) => { codecErr = e; }
+            });
+            vEnc.configure({ codec: 'avc1.640028', width: 1920, height: 1080, bitrate: 9e6, framerate: fps });
+            let aEnc = null;
+            if (withAudio && audioBuffer) {
+                aEnc = new AudioEncoder({
+                    output: (chunk, meta) => muxer.addAudioChunk(chunk, meta),
+                    error: (e) => { codecErr = e; }
+                });
+                aEnc.configure({ codec: 'mp4a.40.2', sampleRate: 48000, numberOfChannels: 2, bitrate: 192000 });
+                // Подаємо аудіо порціями по ~100мс (interleaved f32)
+                const SR = 48000, CH = 2, STEP = 4800;
+                const L = audioBuffer.getChannelData(0);
+                const R = audioBuffer.numberOfChannels > 1 ? audioBuffer.getChannelData(1) : L;
+                for (let i = 0; i < audioBuffer.length; i += STEP) {
+                    const n = Math.min(STEP, audioBuffer.length - i);
+                    const inter = new Float32Array(n * CH);
+                    for (let j = 0; j < n; j++) { inter[j * 2] = L[i + j]; inter[j * 2 + 1] = R[i + j]; }
+                    const ad = new AudioData({
+                        format: 'f32', sampleRate: SR, numberOfFrames: n, numberOfChannels: CH,
+                        timestamp: Math.round((i / SR) * 1e6), data: inter
+                    });
+                    aEnc.encode(ad);
+                    ad.close();
+                }
+            }
+
+            // ── Кадри: детермінований рендер на повній швидкості ──
+            const canvas = document.createElement('canvas');
+            canvas.width = 1920; canvas.height = 1080;
+            const ctx = canvas.getContext('2d');
+            ctx.scale(1920 / CANVAS_W, 1080 / CANVAS_H);
+            const totalFrames = Math.ceil(totalSec * fps);
+            let segIdx = 0;
+            for (let f = 0; f < totalFrames; f++) {
+                if (codecErr) throw codecErr;
+                const t = f / fps;
+                while (segIdx < segments.length - 1 && t >= segments[segIdx].start + segments[segIdx].dur) segIdx++;
+                const seg = segments[segIdx];
+                const local = Math.min(t - seg.start, seg.dur);
+                if (seg.kind === 'transition') {
+                    const prevCanvas = renderSlideToCanvas(seg.prev, getSlideDuration(seg.prev) + 10);
+                    const nextCanvas = renderSlideToCanvas(seg.slide, 0);
+                    drawTransitionFrame(ctx, prevCanvas, nextCanvas, seg.slide.transition, local / seg.dur);
+                } else {
+                    await seekSlideVideosTo(seg.slide, local);
+                    drawSlideFrame(ctx, seg.slide, local);
+                }
+                const frame = new VideoFrame(canvas, { timestamp: Math.round(t * 1e6), duration: Math.round(1e6 / fps) });
+                vEnc.encode(frame, { keyFrame: f % (fps * 2) === 0 });
+                frame.close();
+                // Backpressure: не даємо черзі кодера рости безмежно
+                while (vEnc.encodeQueueSize > 4) await new Promise(r => setTimeout(r, 0));
+                if (f % 15 === 0) {
+                    const pct = f / totalFrames;
+                    setExportProgress(Math.round(pct * 100));
+                    const elapsed = (performance.now() - exportStart) / 1000;
+                    const eta = pct > 0.02 ? (elapsed / pct) * (1 - pct) : 0;
+                    setExportEta(eta ? '~' + formatDuration(eta) : '');
+                    await new Promise(r => setTimeout(r, 0)); // даємо UI дихати
+                }
+            }
+            await vEnc.flush();
+            if (aEnc) await aEnc.flush();
+            muxer.finalize();
+            if (codecErr) throw codecErr;
+
+            const videoBlob = new Blob([muxer.target.buffer], { type: 'video/mp4' });
+            // Звіт відповідності вимогам + швидкість рендера
+            const actualMbps = totalSec > 0 ? (videoBlob.size * 8 / totalSec / 1e6) : 0;
+            const renderSec = (performance.now() - exportStart) / 1000;
+            const speedX = renderSec > 0 ? totalSec / renderSec : 0;
+            toast(actualMbps <= 10.5 ? 'success' : 'error',
+                `⚡ Відео: 1920×1080 · H.264 (MP4) · 30 fps · ${actualMbps.toFixed(1)} Мбіт/с · рендер ${speedX.toFixed(1)}× швидше реального часу`,
+                { duration: 9000 });
+            logChange('Експорт', 'Швидкий експорт (WebCodecs) завершено', {
+                bitrateMbps: Math.round(actualMbps * 100) / 100, renderSec: Math.round(renderSec), speedX: Math.round(speedX * 10) / 10
+            });
+
+            // Вшиваємо проєкт (як у звичайному експорті) і віддаємо файл
+            let finalBlob = videoBlob;
+            try {
+                const snapshot = { studioProVideo: 2, exportedAt: Date.now(), slides: await serializeSlidesForEmbed(slides) };
+                const b64 = btoa(unescape(encodeURIComponent(JSON.stringify(snapshot))));
+                finalBlob = new Blob([videoBlob, `\n${VIDEO_PROJECT_START}\n${b64}\n${VIDEO_PROJECT_END}\n`], { type: 'video/mp4' });
+            } catch (e) { /* завеликий проєкт — чисте відео */ }
+            const fname = `presentation_video_fast${withAudio ? '' : '_silent'}.mp4`;
+            const url = URL.createObjectURL(finalBlob);
+            const a = document.createElement('a');
+            a.href = url; a.download = fname; a.click();
+            setTimeout(() => URL.revokeObjectURL(url), 1000);
+            setExportProgress(100);
+        } catch (err) {
+            logChange('Помилка', 'Швидкий експорт не вдався — фолбек на звичайний', err?.message || String(err));
+            toast('info', 'Швидкий експорт не вдався (' + (err?.message || err) + ') — пробуємо звичайний');
+            isVideoExportingRef.current = false;
+            setIsExporting(false);
+            setExportProgress(0);
+            setExportEta('');
+            return handleExportVideo(opts);
+        } finally {
+            for (const sl of slides) { try { stopSlideVideos(sl); } catch (e) { /* ignore */ } }
+            isVideoExportingRef.current = false;
+            setIsExporting(false);
+            setExportProgress(0);
+            setExportEta('');
+        }
+    };
+
     const handleExportVideo = async (opts = {}) => {
         if (slides.length === 0) return;
         if (isVideoExportingRef.current) return; // вже триває експорт відео — ігноруємо повторний виклик (подвійний клік)
@@ -8389,6 +8641,9 @@ export default function VideoEditor() {
                                                     onGenerateMissing={generateAllMissingSlidesAudio}
                                                 />
                                                 <div className="px-3 py-1.5 text-[10px] font-bold text-slate-400 uppercase tracking-wide bg-slate-50">Відео · 1920×1080 · H.264 · 30 fps · ~9 Мбіт/с</div>
+                                                <button onClick={() => { setExportMenuOpen(false); handleExportVideoFast({ withAudio: true }); }} className="w-full text-left px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-violet-50 flex items-center gap-2" title="Кодування через WebCodecs: у рази швидше реального часу; якщо браузер не підтримує — автоматично звичайний експорт">
+                                                    <Zap size={14} className="text-amber-500" /> ⚡ MP4 швидкий (WebCodecs)
+                                                </button>
                                                 <button onClick={() => { setExportMenuOpen(false); handleExportVideo({ withAudio: true }); }} className="w-full text-left px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-violet-50 flex items-center gap-2"><Film size={14} className="text-[#7c3aed]" /> MP4 зі звуком</button>
                                                 <button onClick={() => { setExportMenuOpen(false); handleExportVideo({ withAudio: false }); }} className="w-full text-left px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-violet-50 flex items-center gap-2"><Film size={14} className="text-slate-400" /> MP4 без звуку</button>
                                                 <div className="px-3 py-1.5 text-[10px] font-bold text-slate-400 uppercase tracking-wide bg-slate-50 border-t border-slate-100">Лише аудіо (озвучка)</div>
