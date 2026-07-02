@@ -941,7 +941,36 @@ const IMAGE_MIME_BY_EXT = {
     ico: 'image/x-icon', cur: 'image/x-icon',
     tif: 'image/tiff', tiff: 'image/tiff',
     avif: 'image/avif',
-    heic: 'image/heic', heif: 'image/heif'
+    heic: 'image/heic', heif: 'image/heif',
+    jxl: 'image/jxl',
+    jxr: 'image/vnd.ms-photo', wdp: 'image/vnd.ms-photo', hdp: 'image/vnd.ms-photo',
+    svgz: 'image/svg+xml' // gzip-стиснений SVG — розпаковується перед показом
+};
+
+// Формати, які рендеряться не в усіх браузерах: перекодовуємо у PNG через
+// власний декодер браузера (Image -> canvas). Після конвертації зображення
+// гарантовано працює всюди: у редакторі, canvas-експорті, .atmo та MP4-циклі.
+const TRANSCODE_TO_PNG = new Set(['image/tiff', 'image/heic', 'image/heif', 'image/x-icon', 'image/vnd.ms-photo', 'image/jxl']);
+const transcodeToPng = (src) => new Promise((resolve) => {
+    if (typeof document === 'undefined') return resolve(null);
+    const img = new Image();
+    img.onload = () => {
+        try {
+            const cv = document.createElement('canvas');
+            cv.width = img.naturalWidth || img.width;
+            cv.height = img.naturalHeight || img.height;
+            if (!cv.width || !cv.height) return resolve(null);
+            cv.getContext('2d').drawImage(img, 0, 0);
+            resolve(cv.toDataURL('image/png'));
+        } catch (e) { resolve(null); }
+    };
+    img.onerror = () => resolve(null);
+    img.src = src;
+});
+// Розпакування gzip (svgz) вбудованим DecompressionStream
+const gunzipToText = async (bytes) => {
+    const stream = new Response(bytes).body.pipeThrough(new DecompressionStream('gzip'));
+    return new TextDecoder().decode(await new Response(stream).arrayBuffer());
 };
 // Визначення формату за магічними байтами — для файлів без/з хибним розширенням
 const sniffImageMime = (b) => {
@@ -953,6 +982,8 @@ const sniffImageMime = (b) => {
     if (b[0] === 0x52 && b[1] === 0x49 && b[2] === 0x46 && b[3] === 0x46
         && b[8] === 0x57 && b[9] === 0x45 && b[10] === 0x42 && b[11] === 0x50) return 'image/webp';
     if (b[0] === 0x00 && b[1] === 0x00 && b[2] === 0x01 && b[3] === 0x00) return 'image/x-icon';
+    if (b[0] === 0x1F && b[1] === 0x8B) return 'application/gzip'; // svgz
+    if (b[0] === 0xFF && b[1] === 0x0A) return 'image/jxl';
     if ((b[0] === 0x49 && b[1] === 0x49 && b[2] === 0x2A) || (b[0] === 0x4D && b[1] === 0x4D && b[3] === 0x2A)) return 'image/tiff';
     if (b[4] === 0x66 && b[5] === 0x74 && b[6] === 0x79 && b[7] === 0x70) { // ISO BMFF "ftyp" -> AVIF/HEIC
         const brand = String.fromCharCode(b[8], b[9], b[10], b[11]);
@@ -2405,8 +2436,24 @@ const extractPptxData = async (file, onProgress) => {
         if (!mime) {
             try { mime = sniffImageMime(await imgFile.async('uint8array')); } catch (e) { /* ignore */ }
         }
+        // SVGZ (gzip-стиснений SVG): розпаковуємо у звичайний SVG dataURL
+        if (ext === 'svgz' || mime === 'application/gzip') {
+            try {
+                const txt = await gunzipToText(await imgFile.async('uint8array'));
+                if (txt.includes('<svg')) return 'data:image/svg+xml;base64,' + btoa(unescape(encodeURIComponent(txt)));
+            } catch (e) { /* впадемо у звичайну гілку нижче */ }
+            if (mime === 'application/gzip') return null;
+        }
         if (!mime) return null; // векторні EMF/WMF браузер не декодує — буде плейсхолдер
-        return `data:${mime};base64,${await imgFile.async('base64')}`;
+        const dataUrl = `data:${mime};base64,${await imgFile.async('base64')}`;
+        // TIFF/HEIC/ICO/JXR/JXL: конвертуємо у PNG, якщо браузер вміє їх декодувати
+        // (напр. Safari декодує TIFF/HEIC) — результат рендериться вже всюди.
+        // Якщо декодер не впорався — віддаємо оригінал (краще спробувати, ніж втратити).
+        if (TRANSCODE_TO_PNG.has(mime)) {
+            const png = await transcodeToPng(dataUrl);
+            if (png) return png;
+        }
+        return dataUrl;
     };
 
     // Витягує відеофайл за rId (a:videoFile) -> blob URL (або зовнішній http-URL)
