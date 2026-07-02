@@ -4432,6 +4432,35 @@ export default function VideoEditor() {
     const [assistantError, setAssistantError] = useState(null);
     const [regeneratingSlideId, setRegeneratingSlideId] = useState(null);
     const [animPrompt, setAnimPrompt] = useState('');
+    // Однотипні анімації: рівно 3 обрані типи на ВСІ слайди (обирає користувач,
+    // за замовчуванням програма пропонує спокійну трійку)
+    const [uniformTypes, setUniformTypes] = useState(['fadeIn', 'floatIn', 'zoomIn']);
+    const applyUniformAnimations = () => {
+        if (!slides.length) return;
+        const [tTitle, tMedia, tRest] = uniformTypes;
+        const plan = slides.map(sl => {
+            let firstText = true;
+            let order = 0;
+            return {
+                slideNumber: sl.slideNumber,
+                narration: sl.text,
+                transition: sl.transition,
+                animations: sl.objects.map(o => {
+                    // Розподіл ролей: перший текст (заголовок) -> тип 1,
+                    // зображення/відео -> тип 2, решта -> тип 3; каскад 0.4с
+                    let type = tRest;
+                    if (o.type === 'text' && firstText) { type = tTitle; firstText = false; }
+                    else if (o.type === 'image' || o.type === 'video') type = tMedia;
+                    return { objectId: o.id, type, delay: Math.round(order++ * 0.4 * 10) / 10, duration: 0.8 };
+                })
+            };
+        });
+        dispatchVideo({ type: 'APPLY_AI_PLAN', plan, keepAudio: true });
+        toast('success', `Усі слайди анімовано трьома типами: ${uniformTypes.map(t => ANIMATIONS[t]?.label || t).join(' · ')}`, {
+            action: { label: 'Повернути', onClick: () => dispatchVideo({ type: 'UNDO' }) }
+        });
+        logChange('Анімація', 'Однотипні анімації на всі слайди', { types: uniformTypes });
+    };
     const [isAutoAnimating, setIsAutoAnimating] = useState(false);
     const [bulkTransition, setBulkTransition] = useState('fade');
     const [scrubTime, setScrubTime] = useState(null);
@@ -8312,6 +8341,36 @@ export default function VideoEditor() {
                                             <button onClick={handleAutoAnimations} disabled={isAutoAnimating} className="px-3 py-1.5 bg-purple-50 text-purple-700 hover:bg-purple-100 rounded-lg text-xs font-semibold transition-colors flex items-center gap-1.5 whitespace-nowrap">
                                                 {isAutoAnimating ? <Loader2 size={14} className="animate-spin" /> : <Sparkles size={14} />}
                                                 {animPrompt.trim() ? 'Згенерувати' : 'Фейд усюди'}
+                                            </button>
+                                        </div>
+                                        {/* Однотипні анімації: 3 обрані типи на всю презентацію */}
+                                        <div className="flex items-center gap-2 flex-wrap mt-2 pt-2 border-t border-slate-100">
+                                            <span className="text-[11px] font-bold text-slate-500 whitespace-nowrap" title="Єдиний стиль: заголовки — тип 1, зображення/відео — тип 2, решта — тип 3, поява каскадом">
+                                                🎯 Однотипні (3 анімації):
+                                            </span>
+                                            {[['заголовки', 0], ['медіа', 1], ['решта', 2]].map(([role, i]) => (
+                                                <label key={i} className="flex items-center gap-1 text-[10px] font-semibold text-slate-400">
+                                                    {role}
+                                                    <select
+                                                        value={uniformTypes[i]}
+                                                        onChange={(e) => setUniformTypes(prev => prev.map((t, j) => (j === i ? e.target.value : t)))}
+                                                        className="text-[11px] font-semibold text-slate-700 border border-slate-200 rounded-lg px-1.5 py-1 outline-none focus:border-[#7c3aed] bg-white max-w-[130px]"
+                                                    >
+                                                        {ANIMATION_OPTION_GROUPS.map(g => (
+                                                            <optgroup key={g.label} label={g.label}>
+                                                                {g.items.filter(([v]) => v !== 'none').map(([val, lbl]) => <option key={val} value={val}>{lbl}</option>)}
+                                                            </optgroup>
+                                                        ))}
+                                                    </select>
+                                                </label>
+                                            ))}
+                                            <button
+                                                onClick={applyUniformAnimations}
+                                                disabled={slides.length === 0}
+                                                className="px-3 py-1.5 bg-emerald-50 text-emerald-700 hover:bg-emerald-100 disabled:opacity-40 rounded-lg text-xs font-bold transition-colors whitespace-nowrap"
+                                                title="Анімувати ВСІ слайди лише цими трьома типами (тексти диктора й озвучка не змінюються)"
+                                            >
+                                                Анімувати всі
                                             </button>
                                         </div>
                                     </div>
