@@ -4409,6 +4409,48 @@ export default function VideoEditor() {
     const [exportEta, setExportEta] = useState('');                  // U-23
     const [scenesCollapsed, setScenesCollapsed] = useState(false);   // U-33
     const [helpOpen, setHelpOpen] = useState(false);                 // U-111
+    const cancelGenerationRef = useRef(false);                       // U-69: зупинка пакетної озвучки
+    const [tourStep, setTourStep] = useState(null);                  // U-14: тур для новачків (null = вимкнено)
+    useEffect(() => { // тур показується один раз — при першому вході в редактор
+        if (slides.length > 0 && !localStorage.getItem('atmo-tour-done')) setTourStep(0);
+    }, [slides.length > 0]); // eslint-disable-line
+
+    // U-13: демо-проєкт — спробувати редактор без власного файлу
+    const startDemoProject = () => {
+        const mkSlide = (num, objects, text, transition) => ({
+            id: crypto.randomUUID(), slideNumber: num, speakerNotes: '', text,
+            background: '#FFFFFF', bgGradient: null, bgImage: null, objects,
+            audioBase64: null, sampleRate: 24000, audioDuration: 0, isGenerating: false,
+            transition: transition || (num === 1 ? 'none' : 'fade'), error: null
+        });
+        const txt = (x, y, w, h, lines, anim, extra) => ({
+            id: crypto.randomUUID(), type: 'text', x, y, w, h,
+            fillColor: null, lineColor: null, vAlign: 'ctr', lines,
+            animation: anim || { type: 'fadeIn', delay: 0, duration: 0.8 }, ...(extra || {})
+        });
+        const demo = [
+            mkSlide(1, [
+                txt(140, 180, 1000, 130, [{ text: 'Ласкаво просимо до Studio Pro 👋', color: '#1e293b', fontSize: 52, bold: true, align: 'ctr' }]),
+                txt(240, 340, 800, 90, [{ text: 'Це демо-проєкт: редагуйте текст подвійним кліком, тягніть об\'єкти, озвучуйте та експортуйте у відео', color: '#64748b', fontSize: 24, bold: false, align: 'ctr' }], { type: 'floatIn', delay: 0.6, duration: 0.8 })
+            ], 'Привіт! Це демонстраційний проєкт Studio Pro. Спробуйте відредагувати текст, додати анімації та озвучити слайди.'),
+            mkSlide(2, [
+                txt(140, 90, 1000, 90, [{ text: 'Формули та анімації', color: '#1e293b', fontSize: 40, bold: true, align: 'ctr' }]),
+                txt(240, 240, 800, 100, [{
+                    text: 'Площа кола: S=πr²', align: 'ctr',
+                    runs: [
+                        { text: 'Площа кола: ', color: '#334155', fontSize: 32, bold: false },
+                        { text: 'S=πr²', color: '#7c3aed', fontSize: 32, italic: true, math: true, mathml: '<math xmlns="http://www.w3.org/1998/Math/MathML" display="inline"><mi>S</mi><mo>=</mo><mi>π</mi><msup><mrow><mi>r</mi></mrow><mrow><mn>2</mn></mrow></msup></math>' }
+                    ]
+                }], { type: 'zoomIn', delay: 0.4, duration: 0.8 }),
+                { id: crypto.randomUUID(), type: 'shape', shapeKind: 'star5', x: 560, y: 420, w: 160, h: 160, fillColor: '#facc15', lineColor: '#eab308', lineWidth: 2, animation: { type: 'spinIn', delay: 1.2, duration: 1 }, exitAnimation: { type: 'fadeOut', at: 6, duration: 0.8 } }
+            ], 'Формули з PowerPoint конвертуються у живий MathML, а кожен об\'єкт має анімації появи та зникнення.')
+        ];
+        dispatchVideo({ type: 'SET_SLIDES', slides: demo });
+        setSelectedSlideId(demo[0].id);
+        setSelectedObjectId(null);
+        toast('success', 'Демо-проєкт створено — експериментуйте!');
+        logChange('Демо', 'Створено демонстраційний проєкт');
+    };
     const voiceSampleCacheRef = useRef(new Map());                   // U-63 voice -> {base64, sampleRate}
     const [voiceSampleLoading, setVoiceSampleLoading] = useState(false);
 
@@ -5031,12 +5073,25 @@ export default function VideoEditor() {
 
     const generateAllMissingSlidesAudio = async () => {
         setIsGeneratingAll(true);
+        cancelGenerationRef.current = false;
         const toGenerate = slides.filter(s => s.text.trim() && !s.audioBase64);
-        if (toGenerate.length) toast('info', `Озвучуємо ${toGenerate.length} слайд(ів)…`);
-        for (const slide of toGenerate) {
-            await generateSlideAudio(slide.id);
+        if (toGenerate.length) {
+            // U-69: чергу можна зупинити — вже озвучені слайди зберігаються
+            toast('info', `Озвучуємо ${toGenerate.length} слайд(ів)… Редагувати інші слайди можна далі.`, {
+                duration: 8000,
+                action: { label: 'Зупинити', onClick: () => { cancelGenerationRef.current = true; } }
+            });
         }
-        if (toGenerate.length) toast('success', 'Пакетну озвучку завершено'); // U-20
+        let done = 0;
+        for (const slide of toGenerate) {
+            if (cancelGenerationRef.current) break;
+            await generateSlideAudio(slide.id);
+            done++;
+        }
+        if (toGenerate.length) {
+            toast(cancelGenerationRef.current ? 'info' : 'success',
+                cancelGenerationRef.current ? `Озвучку зупинено (готово ${done} з ${toGenerate.length})` : 'Пакетну озвучку завершено'); // U-20
+        }
         setIsGeneratingAll(false);
     };
 
@@ -7603,6 +7658,39 @@ export default function VideoEditor() {
                 dict={pronDict}
                 onChange={updatePronDict}
             />
+            {/* U-14: тур для новачків — 4 кроки при першому вході в редактор */}
+            {tourStep != null && (() => {
+                const steps = [
+                    { icon: '🎬', title: 'Сцени зліва', text: 'Кожен слайд — окрема сцена. Клік — обрати, перетягнути — змінити порядок, значки показують озвучку/відео/помилки.' },
+                    { icon: '🖱️', title: 'Канвас у центрі', text: 'Подвійний клік по тексту — редагувати на місці. Тягніть по порожньому — рамкове виділення. ПКМ — меню. Стрілки — точний зсув.' },
+                    { icon: '🎙️', title: 'Озвучка знизу', text: 'Напишіть текст диктора — українські речення озвучаться українським голосом, англійські — британським. «▶ Зразок» — почути голос, «Вимова» — наголоси термінів.' },
+                    { icon: '📥', title: 'Експорт', text: 'Кнопка «Завантажити»: MP4 1080p/H.264/30fps зі звуком. Чекліст покаже, чи всі слайди озвучені. Проєкт автозберігається — нічого не загубиться.' }
+                ];
+                const st = steps[tourStep];
+                const finish = () => { localStorage.setItem('atmo-tour-done', '1'); setTourStep(null); };
+                return (
+                    <div className="fixed inset-0 z-[92] flex items-center justify-center" role="dialog" aria-modal="true" aria-label="Знайомство з редактором">
+                        <div className="absolute inset-0 bg-black/50" onClick={finish} />
+                        <div className="relative bg-white rounded-2xl shadow-2xl w-[420px] max-w-[92vw] p-6 text-center space-y-3">
+                            <div className="text-4xl" aria-hidden="true">{st.icon}</div>
+                            <h2 className="text-base font-bold text-slate-800">{st.title}</h2>
+                            <p className="text-xs text-slate-500 leading-relaxed">{st.text}</p>
+                            <div className="flex items-center justify-center gap-1.5 py-1">
+                                {steps.map((_, i) => (
+                                    <span key={i} className={`w-2 h-2 rounded-full ${i === tourStep ? 'bg-[#7c3aed]' : 'bg-slate-200'}`} />
+                                ))}
+                            </div>
+                            <div className="flex items-center justify-center gap-2">
+                                <button onClick={finish} className="px-4 py-2 rounded-lg text-xs font-semibold text-slate-500 hover:bg-slate-100">Пропустити</button>
+                                <button
+                                    onClick={() => (tourStep + 1 < steps.length ? setTourStep(tourStep + 1) : finish())}
+                                    className="px-5 py-2 rounded-lg text-xs font-bold text-white bg-[#7c3aed] hover:bg-[#6d28d9]"
+                                >{tourStep + 1 < steps.length ? 'Далі →' : 'Почати роботу'}</button>
+                            </div>
+                        </div>
+                    </div>
+                );
+            })()}
             {/* U-111: довідка «Вимоги та поради» */}
             {helpOpen && (
                 <div className="fixed inset-0 z-[90] flex items-center justify-center" role="dialog" aria-modal="true" aria-label="Довідка">
@@ -7739,12 +7827,22 @@ export default function VideoEditor() {
                                     }} className="hidden" />
                                 </label>
                             </div>
-                            <button
-                                onClick={addBlankSlide}
-                                className="text-sm font-semibold text-slate-400 hover:text-[#7c3aed] underline underline-offset-2 transition-colors"
-                            >
-                                або почати з порожнього слайду
-                            </button>
+                            <div className="flex items-center gap-4">
+                                <button
+                                    onClick={addBlankSlide}
+                                    className="text-sm font-semibold text-slate-400 hover:text-[#7c3aed] underline underline-offset-2 transition-colors"
+                                >
+                                    почати з порожнього слайду
+                                </button>
+                                <span className="text-slate-300">·</span>
+                                <button
+                                    onClick={startDemoProject}
+                                    className="text-sm font-semibold text-[#7c3aed] hover:text-[#6d28d9] underline underline-offset-2 transition-colors"
+                                    title="2 готові слайди з формулою та анімаціями — щоб спробувати без свого файлу"
+                                >
+                                    ✨ спробувати на демо
+                                </button>
+                            </div>
                         </div>
                     </div>
                 </div>
