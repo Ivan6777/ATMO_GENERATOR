@@ -384,6 +384,144 @@ export const validatePptxFile = async (file) => {
     return { ok: true };
 };
 
+/* ============================================================================
+ * U-102. Словник вимови TTS: пари «термін → як читати». Підставляється в текст
+ * ЛИШЕ перед генерацією озвучки (на слайді видно оригінал). Зберігається у
+ * localStorage — терміни користувача спільні для всіх його проєктів.
+ * ========================================================================== */
+const PRON_DICT_KEY = 'atmo-pronunciation-dict';
+
+export const loadPronunciationDict = () => {
+    try {
+        const raw = JSON.parse(localStorage.getItem(PRON_DICT_KEY) || '[]');
+        return Array.isArray(raw) ? raw : [];
+    } catch (e) { return []; }
+};
+
+export const savePronunciationDict = (dict) => {
+    try { localStorage.setItem(PRON_DICT_KEY, JSON.stringify(dict || [])); } catch (e) { /* ignore */ }
+};
+
+// Заміна цілих слів без урахування регістру (без lookbehind — сумісно зі старими Safari)
+export const applyPronunciationDict = (text, dict) => {
+    let out = String(text || '');
+    for (const pair of (dict || [])) {
+        const from = (pair.from || '').trim();
+        const to = (pair.to || '').trim();
+        if (!from || !to) continue;
+        const esc = from.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        out = out.replace(
+            new RegExp(`(^|[^\\p{L}\\p{N}])${esc}(?=$|[^\\p{L}\\p{N}])`, 'giu'),
+            (m, lead) => lead + to
+        );
+    }
+    return out;
+};
+
+export const PronunciationDictModal = ({ open, onClose, dict, onChange }) => {
+    React.useEffect(() => {
+        if (!open) return;
+        const h = (e) => { if (e.key === 'Escape') onClose(); };
+        window.addEventListener('keydown', h);
+        return () => window.removeEventListener('keydown', h);
+    }, [open, onClose]);
+    if (!open) return null;
+    const rows = dict && dict.length ? dict : [];
+    const setRow = (i, patch) => onChange(rows.map((r, j) => (j === i ? { ...r, ...patch } : r)));
+    const delRow = (i) => onChange(rows.filter((_, j) => j !== i));
+    const addRow = () => onChange([...rows, { from: '', to: '' }]);
+    return (
+        <div className="fixed inset-0 z-[90] flex items-center justify-center" role="dialog" aria-modal="true" aria-label="Словник вимови">
+            <div className="absolute inset-0 bg-black/40" onClick={onClose} />
+            <div className="relative bg-white rounded-2xl shadow-2xl w-[460px] max-w-[94vw] max-h-[82vh] overflow-y-auto p-5">
+                <div className="flex items-center justify-between mb-1">
+                    <h2 className="text-sm font-bold text-slate-800">Словник вимови</h2>
+                    <button onClick={onClose} aria-label="Закрити" className="text-slate-400 hover:text-slate-600 p-1">✕</button>
+                </div>
+                <p className="text-[11px] text-slate-500 mb-3 leading-relaxed">
+                    Диктор читатиме терміни так, як ви запишете їх у правій колонці (на слайдах текст не змінюється).
+                    Наголос можна підказати подвоєнням наголошеної голосної або дефісами:
+                    «Python → пАйтон», «кафедра → кАфедра», «ArcGIS → арк-джі-ай-ес».
+                </p>
+                <div className="space-y-2">
+                    <div className="grid grid-cols-[1fr_1fr_28px] gap-2 text-[10px] font-bold text-slate-400 uppercase">
+                        <span>Термін у тексті</span><span>Як читати</span><span />
+                    </div>
+                    {rows.map((r, i) => (
+                        <div key={i} className="grid grid-cols-[1fr_1fr_28px] gap-2">
+                            <input
+                                value={r.from}
+                                onChange={(e) => setRow(i, { from: e.target.value })}
+                                placeholder="OSINT"
+                                className="px-2 py-1.5 text-xs border border-slate-200 rounded-lg outline-none focus:border-violet-400 bg-white"
+                            />
+                            <input
+                                value={r.to}
+                                onChange={(e) => setRow(i, { to: e.target.value })}
+                                placeholder="о-сІнт"
+                                className="px-2 py-1.5 text-xs border border-slate-200 rounded-lg outline-none focus:border-violet-400 bg-white"
+                            />
+                            <button onClick={() => delRow(i)} aria-label="Видалити пару" className="text-slate-300 hover:text-red-500 text-sm">✕</button>
+                        </div>
+                    ))}
+                    {rows.length === 0 && (
+                        <div className="text-[11px] text-slate-400 italic py-2 text-center">Поки що порожньо — додайте перший термін</div>
+                    )}
+                </div>
+                <button
+                    onClick={addRow}
+                    className="mt-3 px-3 py-1.5 rounded-lg text-xs font-bold text-white"
+                    style={{ backgroundColor: TOKENS.primary }}
+                >+ Додати термін</button>
+            </div>
+        </div>
+    );
+};
+
+/* ============================================================================
+ * U-110. Error boundary: збій рендера показує картку відновлення, а не
+ * «білий екран». key={selectedSlideId} у місці використання гарантує, що
+ * перемикання слайда автоматично скидає помилку.
+ * ========================================================================== */
+export class UIErrorBoundary extends React.Component {
+    constructor(props) {
+        super(props);
+        this.state = { error: null };
+    }
+    static getDerivedStateFromError(error) { return { error }; }
+    componentDidCatch(error, info) {
+        if (this.props.onError) this.props.onError(error, info);
+    }
+    render() {
+        if (this.state.error) {
+            return (
+                <div className="flex-1 flex items-center justify-center p-8 bg-slate-50">
+                    <div className="bg-white border border-red-200 rounded-2xl shadow-lg p-6 max-w-md text-center space-y-3">
+                        <div className="text-2xl" aria-hidden="true">⚠️</div>
+                        <div className="text-sm font-bold text-slate-800">Не вдалося відобразити {this.props.label || 'вміст'}</div>
+                        <div className="text-[11px] text-slate-500 break-words">{String(this.state.error && this.state.error.message || this.state.error)}</div>
+                        <div className="flex items-center justify-center gap-2">
+                            <button
+                                onClick={() => this.setState({ error: null })}
+                                className="px-4 py-2 rounded-lg text-xs font-bold text-white"
+                                style={{ backgroundColor: TOKENS.primary }}
+                            >Спробувати ще раз</button>
+                            {this.props.onUndo && (
+                                <button
+                                    onClick={() => { this.props.onUndo(); this.setState({ error: null }); }}
+                                    className="px-4 py-2 rounded-lg text-xs font-bold text-slate-600 bg-slate-100 hover:bg-slate-200"
+                                >Скасувати останню дію</button>
+                            )}
+                        </div>
+                        <div className="text-[10px] text-slate-400">Проєкт не втрачено: він автоматично збережений у сховищі браузера.</div>
+                    </div>
+                </div>
+            );
+        }
+        return this.props.children;
+    }
+}
+
 /* ── U-21. Людські пояснення помилок API озвучки ── */
 export const humanizeTtsError = (message) => {
     const m = String(message || '');

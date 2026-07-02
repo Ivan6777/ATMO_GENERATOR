@@ -4,7 +4,9 @@ import {
     useAutosave, useBeforeUnloadGuard, AutosaveIndicator,
     loadProjectSnapshot, clearProjectSnapshot,
     RestoreBanner, ImportProgressOverlay, ExportReadiness, formatDuration,
-    validatePptxFile, humanizeTtsError
+    validatePptxFile, humanizeTtsError,
+    loadPronunciationDict, savePronunciationDict, applyPronunciationDict, PronunciationDictModal,
+    UIErrorBoundary
 } from './UXKit.jsx';
 /* ============================================================================
  * ІКОНКИ — inline SVG (замість lucide-react CDN, що не резолвиться у цьому
@@ -265,6 +267,25 @@ const downloadChangeLog = (format = 'txt') => {
  * ========================================================================== */
 
 let currentCtx = null;
+
+// U-105: завжди живий AudioContext. Браузер може «приспати» (suspended) або
+// закрити контекст — звук зникає до перезавантаження сторінки. Тут він
+// автоматично створюється заново/пробуджується перед кожним використанням.
+const getLiveAudioCtx = () => {
+    if (!currentCtx || currentCtx.state === 'closed') {
+        currentCtx = new (window.AudioContext || window.webkitAudioContext)();
+    }
+    if (currentCtx.state === 'suspended') {
+        try { currentCtx.resume(); } catch (e) { /* ignore */ }
+    }
+    return currentCtx;
+};
+// Примусовий перезапуск звукового рушія (кнопка «Перезапустити звук»)
+const restartAudioEngine = () => {
+    try { if (currentCtx && currentCtx.state !== 'closed') currentCtx.close(); } catch (e) { /* ignore */ }
+    currentCtx = null;
+    return getLiveAudioCtx();
+};
 
 // Внутрішня система координат слайду (повне HD 16:9)
 const CANVAS_W = 1280;
@@ -3675,6 +3696,19 @@ export default function VideoEditor() {
         clearProjectSnapshot();
         setRestoreSnapshot(null);
     };
+    // U-102: словник вимови TTS (localStorage — терміни спільні для всіх проєктів)
+    const [pronDict, setPronDict] = useState(loadPronunciationDict);
+    const [pronDictOpen, setPronDictOpen] = useState(false);
+    const updatePronDict = (d) => { setPronDict(d); savePronunciationDict(d); };
+    // U-105: watchdog звуку — раз на 5с будимо приспаний браузером AudioContext
+    useEffect(() => {
+        const id = setInterval(() => {
+            if (currentCtx && currentCtx.state === 'suspended') {
+                try { currentCtx.resume(); } catch (e) { /* ignore */ }
+            }
+        }, 5000);
+        return () => clearInterval(id);
+    }, []);
     const [pauseSeconds, setPauseSeconds] = useState(1);             // тривалість паузи (сек), яку вставляє кнопка [ПАУЗА]
     const updateVideoVoice2 = (updates) => {
         setVideoVoice2(prev => ({ ...prev, ...updates }));
@@ -4093,9 +4127,11 @@ export default function VideoEditor() {
                     sampleRate = sr;
                 }
 
-                // Двомовний текст озвучуємо фрагментами: кожне речення — голосом своєї
-                // мови (укр -> український, англ -> британська англійська)
-                for (const langPart of splitTextByLanguage(seg.text)) {
+                // U-102: підставляємо словник вимови (лише для диктора — текст слайдів
+                // не змінюється), далі двомовний текст озвучуємо фрагментами: кожне
+                // речення — голосом своєї мови (укр -> український, англ -> британська)
+                const spokenText = applyPronunciationDict(seg.text, pronDict);
+                for (const langPart of splitTextByLanguage(spokenText)) {
                     const res = await fetchTTSWithRetry(langPart.text, pickVoiceForText(vp.voice, langPart.text), buildStyleDirection(vp.rate, vp.style));
                     parts.push(res.base64);
                     sampleRate = res.sampleRate;
@@ -5061,7 +5097,7 @@ export default function VideoEditor() {
             playingSlideSourceRef.current = null;
         }
         if (playingSlideId === id) { setPlayingSlideId(null); return; }
-        if (!currentCtx) currentCtx = new (window.AudioContext || window.webkitAudioContext)();
+        getLiveAudioCtx(); // U-105: авто-відновлення після suspend/closed
         const buffer = base64ToAudioBuffer(currentCtx, base64PCM, sampleRate);
         const source = currentCtx.createBufferSource();
         source.buffer = buffer;
@@ -5101,7 +5137,7 @@ export default function VideoEditor() {
             await playSlideVideos(slide);
 
             if (slide.audioBase64) {
-                if (!currentCtx) currentCtx = new (window.AudioContext || window.webkitAudioContext)();
+                getLiveAudioCtx(); // U-105: авто-відновлення після suspend/closed
                 const buffer = base64ToAudioBuffer(currentCtx, slide.audioBase64, slide.sampleRate);
                 source = currentCtx.createBufferSource();
                 source.buffer = buffer;
@@ -5198,7 +5234,7 @@ export default function VideoEditor() {
                     playingVideoSlide = seg.slide;
                     if (source) { try { source.stop(); } catch (e) { /* вже зупинено */ } source = null; }
                     if (seg.slide.audioBase64) {
-                        if (!currentCtx) currentCtx = new (window.AudioContext || window.webkitAudioContext)();
+                        getLiveAudioCtx(); // U-105: авто-відновлення після suspend/closed
                         const buffer = base64ToAudioBuffer(currentCtx, seg.slide.audioBase64, seg.slide.sampleRate);
                         source = currentCtx.createBufferSource();
                         source.buffer = buffer;
@@ -6516,6 +6552,12 @@ export default function VideoEditor() {
             <ToastHost />
             <ImportProgressOverlay progress={importProgress} />
             <ShortcutsModal open={shortcutsOpen} onClose={() => setShortcutsOpen(false)} />
+            <PronunciationDictModal
+                open={pronDictOpen}
+                onClose={() => setPronDictOpen(false)}
+                dict={pronDict}
+                onChange={updatePronDict}
+            />
 
             {slides.length === 0 ? (
                 /* ===== ЕКРАН ЗАВАНТАЖЕННЯ PPTX ===== */
@@ -6586,7 +6628,16 @@ export default function VideoEditor() {
                     </div>
                 </div>
             ) : (
-                /* ===== ОСНОВНИЙ РЕДАКТОР (Synthesia layout) ===== */
+                /* ===== ОСНОВНИЙ РЕДАКТОР (Synthesia layout) =====
+                   U-110: error boundary — збій рендера показує картку відновлення
+                   замість «білого екрана»; key за слайдом, тож перемикання сцени
+                   у списку зліва теж скидає помилку */
+                <UIErrorBoundary
+                    key={selectedSlideId || 'editor'}
+                    label="редактор"
+                    onUndo={() => dispatchVideo({ type: 'UNDO' })}
+                    onError={(err) => logChange('Помилка', 'Збій рендера редактора (перехоплено)', err?.message)}
+                >
                 <div className="flex-1 flex overflow-hidden">
 
                     {/* ── ЛІВА ПАНЕЛЬ: сцени ── */}
@@ -6737,6 +6788,15 @@ export default function VideoEditor() {
                             <div className="flex items-center gap-2">
                                 {/* U-04: стан автозбереження */}
                                 <AutosaveIndicator status={autosave.status} savedAt={autosave.savedAt} />
+                                {/* U-105: якщо звук зник — перезапуск аудіорушія без перезавантаження сторінки */}
+                                <button
+                                    onClick={() => { restartAudioEngine(); toast('success', 'Звуковий рушій перезапущено'); }}
+                                    aria-label="Перезапустити звук"
+                                    title="Перезапустити звук (якщо озвучка перестала грати)"
+                                    className="p-1.5 rounded text-slate-400 hover:text-[#7c3aed] hover:bg-slate-100 transition-colors"
+                                >
+                                    <Headphones size={14} />
+                                </button>
                                 {/* U-72: довідка гарячих клавіш */}
                                 <button
                                     onClick={() => setShortcutsOpen(true)}
@@ -7326,6 +7386,12 @@ export default function VideoEditor() {
                                     >
                                         {renderVoiceOptions()}
                                     </select>
+                                    {/* U-102: словник вимови складних термінів */}
+                                    <button
+                                        onClick={() => setPronDictOpen(true)}
+                                        className="text-[9px] font-bold text-slate-400 hover:text-[#7c3aed] underline underline-offset-2"
+                                        title="Словник вимови: як диктор читає складні терміни й наголоси"
+                                    >Вимова{pronDict.length ? ` (${pronDict.length})` : ''}</button>
                                     {videoDialog && <span className="text-[8px] font-bold text-indigo-500">Диктор 1</span>}
                                 </div>
                                 {/* Текст сценарію */}
@@ -8159,6 +8225,7 @@ export default function VideoEditor() {
                         )}
                     </div>
                 </div>
+                </UIErrorBoundary>
             )}
         </div>
     );
