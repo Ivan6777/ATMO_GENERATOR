@@ -4366,6 +4366,151 @@ export default function VideoEditor() {
         }, 5000);
         return () => clearInterval(id);
     }, []);
+    // ── UX-батч: перетягування слайдів, рамкове виділення, контекстне меню,
+    //    вирівнювання, зразки голосів, ETA експорту ──
+    const slideDragIdxRef = useRef(null);                            // U-26
+    const [marqueeRect, setMarqueeRect] = useState(null);            // U-38
+    const [ctxMenu, setCtxMenu] = useState(null);                    // U-42 {x,y,objId}
+    const [exportEta, setExportEta] = useState('');                  // U-23
+    const voiceSampleCacheRef = useRef(new Map());                   // U-63 voice -> {base64, sampleRate}
+    const [voiceSampleLoading, setVoiceSampleLoading] = useState(false);
+
+    // U-26: перетягування слайдів у панелі сцен (перенумерація зберігається)
+    const reorderSlides = (from, to) => {
+        if (from == null || to == null || from === to) return;
+        const next = [...slides];
+        const [moved] = next.splice(from, 1);
+        next.splice(to, 0, moved);
+        dispatchVideo({ type: 'SET_SLIDES', slides: next.map((sl, i) => ({ ...sl, slideNumber: i + 1 })) });
+        logChange('Слайд', `Слайд переміщено: ${from + 1} → ${to + 1}`);
+    };
+
+    // U-40/U-41: вирівнювання та рівномірний розподіл виділених об'єктів
+    const alignSelected = (mode) => {
+        const slide = slides.find(sl => sl.id === selectedSlideId);
+        if (!slide || multiSelectedIds.length < 2) return;
+        const objs = multiSelectedIds.map(id => slide.objects.find(o => o.id === id)).filter(Boolean);
+        if (objs.length < 2) return;
+        const minX = Math.min(...objs.map(o => o.x)), maxX = Math.max(...objs.map(o => o.x + o.w));
+        const minY = Math.min(...objs.map(o => o.y)), maxY = Math.max(...objs.map(o => o.y + o.h));
+        const moves = {};
+        if (mode === 'distH' || mode === 'distV') {
+            const horiz = mode === 'distH';
+            const sorted = [...objs].sort((a, b) => (horiz ? a.x - b.x : a.y - b.y));
+            const total = horiz ? maxX - minX : maxY - minY;
+            const sumSize = sorted.reduce((acc, o) => acc + (horiz ? o.w : o.h), 0);
+            const gap = (total - sumSize) / (sorted.length - 1);
+            let cursor = horiz ? minX : minY;
+            for (const o of sorted) {
+                moves[o.id] = horiz ? { x: Math.round(cursor), y: o.y } : { x: o.x, y: Math.round(cursor) };
+                cursor += (horiz ? o.w : o.h) + gap;
+            }
+        } else {
+            for (const o of objs) {
+                let x = o.x, y = o.y;
+                if (mode === 'l') x = minX;
+                else if (mode === 'cx') x = Math.round((minX + maxX) / 2 - o.w / 2);
+                else if (mode === 'r') x = maxX - o.w;
+                else if (mode === 't') y = minY;
+                else if (mode === 'cy') y = Math.round((minY + maxY) / 2 - o.h / 2);
+                else if (mode === 'b') y = maxY - o.h;
+                moves[o.id] = { x, y };
+            }
+        }
+        dispatchVideo({ type: 'MOVE_OBJECTS', slideId: slide.id, moves });
+        logChange('Об\'єкт', `Вирівнювання (${mode}): ${objs.length} об'єктів`);
+    };
+
+    // U-38: рамкове виділення по порожньому місцю канваса
+    const startMarquee = (e) => {
+        if (!workspaceRef.current) return;
+        const host = workspaceRef.current.getBoundingClientRect();
+        const sx = e.clientX - host.left, sy = e.clientY - host.top;
+        setSelectedObjectId(null);
+        setMultiSelectedIds([]);
+        const calc = (ev) => ({
+            x: Math.min(sx, ev.clientX - host.left),
+            y: Math.min(sy, ev.clientY - host.top),
+            w: Math.abs(ev.clientX - host.left - sx),
+            h: Math.abs(ev.clientY - host.top - sy)
+        });
+        const move = (ev) => setMarqueeRect(calc(ev));
+        const up = (ev) => {
+            window.removeEventListener('mousemove', move);
+            window.removeEventListener('mouseup', up);
+            const r = calc(ev);
+            setMarqueeRect(null);
+            if (r.w < 6 && r.h < 6) return; // це був просто клік — зняти виділення
+            const sc = editorScaleRef.current || 1;
+            const rx = r.x / sc, ry = r.y / sc, rw = r.w / sc, rh = r.h / sc;
+            const slide = slides.find(sl => sl.id === selectedSlideId);
+            if (!slide) return;
+            const hit = slide.objects
+                .filter(o => o.x < rx + rw && o.x + o.w > rx && o.y < ry + rh && o.y + o.h > ry)
+                .map(o => o.id);
+            if (hit.length === 1) { setSelectedObjectId(hit[0]); setMultiSelectedIds([]); }
+            else if (hit.length > 1) { setMultiSelectedIds(hit); setSelectedObjectId(null); }
+        };
+        window.addEventListener('mousemove', move);
+        window.addEventListener('mouseup', up);
+    };
+
+    // U-63: прослуховування зразка голосу (кешується на сесію)
+    const playVoiceSample = async (voiceSel) => {
+        if (voiceSampleLoading) return;
+        try {
+            setVoiceSampleLoading(true);
+            let sample = voiceSampleCacheRef.current.get(voiceSel);
+            if (!sample) {
+                const phrase = voiceSel.endsWith('-UK') ? 'Hello! This is how my voice sounds.'
+                    : voiceSel.endsWith('-DE') ? 'Hallo! So klingt meine Stimme.'
+                        : 'Привіт! Ось так звучить мій голос.';
+                sample = await fetchTTSWithRetry(phrase, voiceSel, '', 2);
+                voiceSampleCacheRef.current.set(voiceSel, sample);
+            }
+            const ctx = getLiveAudioCtx();
+            const buf = base64ToAudioBuffer(ctx, sample.base64, sample.sampleRate);
+            const srcNode = ctx.createBufferSource();
+            srcNode.buffer = buf;
+            srcNode.connect(ctx.destination);
+            srcNode.start();
+        } catch (e) {
+            toast('error', humanizeTtsError(e.message));
+        } finally {
+            setVoiceSampleLoading(false);
+        }
+    };
+
+    // U-05: проєкт як файл .atmo (JSON зі вшитими медіа) — Ctrl+S / кнопка в панелі сцен
+    const saveProjectToFile = async () => {
+        if (!slides.length) return;
+        try {
+            const data = { studioProVideo: 2, exportedAt: Date.now(), slides: await serializeSlidesForEmbed(slides) };
+            const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = 'presentation.atmo';
+            a.click();
+            setTimeout(() => URL.revokeObjectURL(url), 1000);
+            toast('success', 'Проєкт збережено у файл .atmo');
+            logChange('Проєкт', 'Збережено у файл .atmo', { slides: slides.length });
+        } catch (e) { toast('error', 'Не вдалося зберегти проєкт: ' + e.message); }
+    };
+    const openProjectFile = async (file) => {
+        try {
+            const data = JSON.parse(await file.text());
+            if (!data.slides || !data.slides.length) throw new Error('файл не містить проєкту');
+            const { slides: revived, deadMedia } = reviveEmbeddedSlides(data.slides);
+            dispatchVideo({ type: 'SET_SLIDES', slides: revived });
+            setSelectedSlideId(revived[0]?.id || null);
+            setSelectedObjectId(null);
+            if (deadMedia > 0) toast('error', `Не відновлено медіа: ${deadMedia} (файл зі старої версії)`);
+            toast('success', `Проєкт відкрито: ${revived.length} слайд(ів)`);
+            logChange('Проєкт', `Відкрито файл .atmo: "${file.name}"`, { slides: revived.length });
+        } catch (e) { toast('error', 'Не вдалося відкрити .atmo: ' + e.message); }
+    };
+
     const [pauseSeconds, setPauseSeconds] = useState(1);             // тривалість паузи (сек), яку вставляє кнопка [ПАУЗА]
     const updateVideoVoice2 = (updates) => {
         setVideoVoice2(prev => ({ ...prev, ...updates }));
@@ -4533,6 +4678,20 @@ export default function VideoEditor() {
 
             if (e.key === '?') { e.preventDefault(); setShortcutsOpen(true); return; } // U-72
 
+            if (ctrl && e.key === 's') { e.preventDefault(); saveProjectToFile(); return; } // U-76
+
+            if (e.key === 'Tab' && selectedSlideId) { // U-45: обхід об'єктів слайда
+                const slide = slides.find(sl => sl.id === selectedSlideId);
+                if (slide && slide.objects.length) {
+                    e.preventDefault();
+                    const i = slide.objects.findIndex(o => o.id === selectedObjectId);
+                    const next = slide.objects[(i + (shift ? -1 : 1) + slide.objects.length) % slide.objects.length];
+                    setSelectedObjectId(next.id);
+                    setMultiSelectedIds([]);
+                }
+                return;
+            }
+
             const step = shift ? 10 : 1;
             if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown'].includes(e.key) && selectedSlideId) {
                 e.preventDefault();
@@ -4648,9 +4807,17 @@ export default function VideoEditor() {
                 });
             }
         } else {
+            // U-51: Shift під час resize — збереження пропорцій
+            let nw = Math.max(20, Math.round(d.origW + dx));
+            let nh = Math.max(20, Math.round(d.origH + dy));
+            if (e.shiftKey && d.origW > 0 && d.origH > 0) {
+                const k = Math.max(nw / d.origW, nh / d.origH);
+                nw = Math.max(20, Math.round(d.origW * k));
+                nh = Math.max(20, Math.round(d.origH * k));
+            }
             dispatchVideo({
                 type: 'UPDATE_OBJECT', slideId: d.slideId, objectId: d.objectId,
-                updates: { w: Math.max(20, Math.round(d.origW + dx)), h: Math.max(20, Math.round(d.origH + dy)) }
+                updates: { w: nw, h: nh }
             });
         }
     }, [slides]);
@@ -4674,6 +4841,11 @@ export default function VideoEditor() {
     const startObjectDrag = (e, slideId, obj, mode) => {
         e.preventDefault();
         e.stopPropagation();
+        if (obj.locked) { // U-53: закріплений об'єкт можна виділити, але не зсунути
+            setSelectedObjectId(obj.id);
+            setMultiSelectedIds([]);
+            return;
+        }
         const isInMulti = multiSelectedIds.includes(obj.id);
         const wasSelected = selectedObjectId === obj.id && !isInMulti && !e.shiftKey;
         if (!e.shiftKey && !isInMulti) {
@@ -6094,6 +6266,10 @@ export default function VideoEditor() {
                 }
             };
 
+            // U-23: повна тривалість майбутнього відео (слайди + переходи) для ETA
+            const totalExportSec = slides.reduce((acc, sl, k) =>
+                acc + getSlideDuration(sl) + (k > 0 ? ((TRANSITIONS[sl.transition] || TRANSITIONS.none).duration || 0) : 0), 0);
+
             let prevSlide = null;
 
             for (let i = 0; i < slides.length; i++) {
@@ -6149,7 +6325,10 @@ export default function VideoEditor() {
                 await drawTimed(slideDuration, (t, frame) => {
                     drawSlideFrame(ctx, slide, t);
                     if (frame % 10 === 0) {
-                        setExportProgress(Math.round(((i + t / slideDuration) / slides.length) * 100));
+                        const pct = (i + t / slideDuration) / slides.length;
+                        setExportProgress(Math.round(pct * 100));
+                        // U-23: рендер іде в реальному часі, тож залишок = решта тривалості відео
+                        setExportEta('~' + formatDuration(Math.max(0, totalExportSec * (1 - pct))));
                     }
                 });
                 stopSlideVideos(slide);
@@ -6182,6 +6361,7 @@ export default function VideoEditor() {
             a.download = fname;
             a.click();
             setTimeout(() => URL.revokeObjectURL(url), 1000);
+            toast('success', `Відео готове: ${fname}`); // U-22
             logChange('Експорт', `Відео збережено: ${fname}`, { format: mimeType, resolution: '1920x1080', fps: 30, bitrate: '~9 Mbps' });
 
         } catch (err) {
@@ -6210,6 +6390,7 @@ export default function VideoEditor() {
             isVideoExportingRef.current = false;
             setIsExporting(false);
             setExportProgress(0);
+            setExportEta('');
         }
     };
 
@@ -6324,6 +6505,7 @@ export default function VideoEditor() {
     // .mp4/.webm (експортований цим редактором) → відновлення проєкту.
     const handleIncomingFile = (file) => {
         if (!file) return;
+        if (/\.atmo$/i.test(file.name || '')) { openProjectFile(file); return; } // U-05
         const isVideoFile = /\.(mp4|webm)$/i.test(file.name || '') || /^video\//.test(file.type || '');
         if (isVideoFile) importVideoProject(file);
         else processPPTXFile(file);
@@ -6727,11 +6909,37 @@ export default function VideoEditor() {
                                 <input
                                     type="number"
                                     value={Math.round(obj[key])}
-                                    onChange={(e) => updateObj({ [key]: parseInt(e.target.value, 10) || 0 })}
+                                    onChange={(e) => {
+                                        const val = parseInt(e.target.value, 10) || 0;
+                                        // U-56: замок пропорцій — W і H змінюються разом
+                                        if (obj.aspectLocked && (key === 'w' || key === 'h') && obj.w > 0 && obj.h > 0) {
+                                            const ratio = obj.w / obj.h;
+                                            updateObj(key === 'w'
+                                                ? { w: val, h: Math.max(4, Math.round(val / ratio)) }
+                                                : { h: val, w: Math.max(4, Math.round(val * ratio)) });
+                                        } else updateObj({ [key]: val });
+                                    }}
                                     className="w-full px-1.5 py-1 text-xs border border-slate-200 rounded-lg outline-none focus:border-indigo-400 bg-white"
                                 />
                             </label>
                         ))}
+                    </div>
+                    {/* U-56 замок пропорцій + U-53 закріплення об'єкта */}
+                    <div className="grid grid-cols-2 gap-2">
+                        <button
+                            onClick={() => updateObj({ aspectLocked: !obj.aspectLocked })}
+                            className={`px-2 py-1.5 rounded-lg text-[11px] font-bold border transition-colors flex items-center justify-center gap-1 ${obj.aspectLocked ? 'bg-violet-50 border-violet-300 text-[#7c3aed]' : 'bg-white border-slate-200 text-slate-500 hover:bg-slate-50'}`}
+                            title="Пропорції W:H змінюються разом"
+                        >
+                            {obj.aspectLocked ? <Lock size={11} /> : <Unlock size={11} />} Пропорції
+                        </button>
+                        <button
+                            onClick={() => { updateObj({ locked: !obj.locked }); toast('info', obj.locked ? 'Об\'єкт розблоковано' : 'Об\'єкт закріплено — переміщення вимкнено'); }}
+                            className={`px-2 py-1.5 rounded-lg text-[11px] font-bold border transition-colors flex items-center justify-center gap-1 ${obj.locked ? 'bg-amber-50 border-amber-300 text-amber-600' : 'bg-white border-slate-200 text-slate-500 hover:bg-slate-50'}`}
+                            title="Закріплений об'єкт не рухається мишею (захист від випадкових зсувів)"
+                        >
+                            {obj.locked ? <Lock size={11} /> : <Unlock size={11} />} {obj.locked ? 'Закріплено' : 'Закріпити'}
+                        </button>
                     </div>
 
                     {/* Прозорість блоку */}
@@ -6890,7 +7098,7 @@ export default function VideoEditor() {
                                                 className="flex-1 px-1.5 py-1 text-xs border border-slate-200 rounded-lg outline-none focus:border-indigo-400 bg-white"
                                             >
                                                 <option value="">(тема)</option>
-                                                {fontList.map(f => <option key={f} value={f}>{f}</option>)}
+                                                {fontList.map(f => <option key={f} value={f} style={{ fontFamily: f }}>{f}</option>)}
                                             </select>
                                         </label>
                                         {/* U-101: міжрядковий інтервал — лікує «великі пробіли між написами» */}
@@ -7342,6 +7550,50 @@ export default function VideoEditor() {
                 dict={pronDict}
                 onChange={updatePronDict}
             />
+            {/* U-79/U-85: видимий фокус для клавіатури + повага до reduced-motion */}
+            <style>{`
+                :focus-visible { outline: 2px solid #7c3aed; outline-offset: 2px; }
+                @media (prefers-reduced-motion: reduce) {
+                    *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+                }
+            `}</style>
+            {/* U-42: контекстне меню об'єкта (ПКМ) */}
+            {ctxMenu && (() => {
+                const cSlide = slides.find(sl => sl.id === selectedSlideId);
+                const cObj = cSlide && cSlide.objects.find(o => o.id === ctxMenu.objId);
+                if (!cSlide || !cObj) return null;
+                const item = (label, fn, danger) => (
+                    <button
+                        key={label}
+                        onClick={() => { setCtxMenu(null); fn(); }}
+                        className={`w-full text-left px-3 py-1.5 hover:bg-violet-50 ${danger ? 'text-red-600 hover:bg-red-50' : 'text-slate-700'}`}
+                    >{label}</button>
+                );
+                return (
+                    <>
+                        <div className="fixed inset-0 z-[110]" onClick={() => setCtxMenu(null)} onContextMenu={(e) => { e.preventDefault(); setCtxMenu(null); }} />
+                        <div
+                            className="fixed z-[111] bg-white rounded-xl shadow-2xl border border-slate-200 py-1 w-52 text-xs font-semibold"
+                            style={{ left: Math.min(ctxMenu.x, window.innerWidth - 220), top: Math.min(ctxMenu.y, window.innerHeight - 230) }}
+                        >
+                            {item('Дублювати  (Ctrl+D)', () => {
+                                const newId = 'obj_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
+                                dispatchVideo({ type: 'DUPLICATE_OBJECT', slideId: cSlide.id, objectId: cObj.id, newId });
+                                setSelectedObjectId(newId);
+                            })}
+                            {item('Шар вище  ↑', () => dispatchVideo({ type: 'REORDER_OBJECT', slideId: cSlide.id, objectId: cObj.id, direction: 'up' }))}
+                            {item('Шар нижче  ↓', () => dispatchVideo({ type: 'REORDER_OBJECT', slideId: cSlide.id, objectId: cObj.id, direction: 'down' }))}
+                            {item(cObj.locked ? 'Відкріпити' : 'Закріпити (без руху)', () =>
+                                dispatchVideo({ type: 'UPDATE_OBJECT', slideId: cSlide.id, objectId: cObj.id, updates: { locked: !cObj.locked } }))}
+                            {item('Видалити  (Del)', () => {
+                                dispatchVideo({ type: 'DELETE_OBJECTS', slideId: cSlide.id, objectIds: [cObj.id] });
+                                setSelectedObjectId(null);
+                                toast('info', 'Об\'єкт видалено', { action: { label: 'Повернути', onClick: () => dispatchVideo({ type: 'UNDO' }) } });
+                            }, true)}
+                        </div>
+                    </>
+                );
+            })()}
 
             {slides.length === 0 ? (
                 /* ===== ЕКРАН ЗАВАНТАЖЕННЯ PPTX ===== */
@@ -7450,6 +7702,14 @@ export default function VideoEditor() {
                             <Film size={13} /> Імпорт з відео
                         </button>
                         <button
+                            onClick={saveProjectToFile}
+                            disabled={slides.length === 0}
+                            className="mx-2 mb-2 px-3 py-2 text-xs font-semibold text-slate-600 bg-slate-100 hover:bg-slate-200 disabled:opacity-40 rounded-lg transition-colors flex items-center justify-center gap-1.5"
+                            title="Зберегти проєкт у файл .atmo — відкривається перетягуванням на стартовий екран (Ctrl+S)"
+                        >
+                            <Download size={13} /> Зберегти .atmo
+                        </button>
+                        <button
                             onClick={addBlankSlide}
                             className="mx-2 mb-2 px-3 py-2 text-xs font-semibold text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors flex items-center justify-center gap-1.5"
                             title="Додати порожній слайд"
@@ -7460,7 +7720,15 @@ export default function VideoEditor() {
                             {slides.map((sl, idx) => {
                                 const isActive = sl.id === selectedSlideId;
                                 return (
-                                    <div key={sl.id} className="relative group/slide">
+                                    <div
+                                        key={sl.id}
+                                        className="relative group/slide"
+                                        draggable
+                                        onDragStart={(e) => { slideDragIdxRef.current = idx; e.dataTransfer.effectAllowed = 'move'; }}
+                                        onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; }}
+                                        onDrop={(e) => { e.preventDefault(); reorderSlides(slideDragIdxRef.current, idx); slideDragIdxRef.current = null; }}
+                                        title="Перетягніть, щоб змінити порядок слайдів"
+                                    >
                                         {idx > 0 && (
                                             <div className="flex items-center justify-center gap-1 py-0.5" title="Перехід від попереднього слайда">
                                                 <Zap size={9} className="text-slate-300 flex-shrink-0" />
@@ -7626,7 +7894,7 @@ export default function VideoEditor() {
                                         className="px-4 py-1.5 bg-[#7c3aed] hover:bg-[#6d28d9] disabled:bg-slate-300 text-white rounded-lg text-xs font-bold shadow-sm transition-all flex items-center gap-1.5"
                                     >
                                         {(isExporting || isExportingAudio) ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}
-                                        {isExporting ? `${exportProgress}%` : (isExportingAudio ? '...' : 'Завантажити')}
+                                        {isExporting ? `${exportProgress}%${exportEta ? ' · ' + exportEta : ''}` : (isExportingAudio ? '...' : 'Завантажити')}
                                         {!isExporting && !isExportingAudio && <ChevronDown size={12} />}
                                     </button>
                                     {exportMenuOpen && !isExporting && !isExportingAudio && (
@@ -7819,6 +8087,7 @@ export default function VideoEditor() {
                                 <div className="relative w-full h-full flex items-center justify-center">
                                     <div
                                         ref={workspaceRef}
+                                        onMouseDown={(e) => { if (e.target === e.currentTarget && !interactiveMode) startMarquee(e); }}
                                         className="relative rounded-md shadow-2xl overflow-hidden"
                                         style={{
                                             width: '100%',
@@ -7829,6 +8098,11 @@ export default function VideoEditor() {
                                             backgroundSize: '100% 100%'
                                         }}
                                     >
+                                        {/* U-38: рамка виділення */}
+                                        {marqueeRect && (
+                                            <div className="absolute border-2 border-[#7c3aed] bg-violet-500/10 pointer-events-none z-[998]"
+                                                style={{ left: marqueeRect.x, top: marqueeRect.y, width: marqueeRect.w, height: marqueeRect.h }} />
+                                        )}
                                         {vSlide.objects.map((obj, idx) => {
                                             const isObjSelected = obj.id === selectedObjectId;
                                             const isMultiSelected = multiSelectedIds.includes(obj.id);
@@ -7855,6 +8129,12 @@ export default function VideoEditor() {
                                                     }}
                                                     onDoubleClick={(e) => {
                                                         if (obj.type === 'text') { e.stopPropagation(); setSelectedObjectId(obj.id); setEditingObjectId(obj.id); setMultiSelectedIds([]); }
+                                                    }}
+                                                    onContextMenu={(e) => { // U-42
+                                                        if (interactiveMode) return;
+                                                        e.preventDefault(); e.stopPropagation();
+                                                        setSelectedObjectId(obj.id); setMultiSelectedIds([]);
+                                                        setCtxMenu({ x: e.clientX, y: e.clientY, objId: obj.id });
                                                     }}
                                                     className={`absolute ${isEditing ? 'cursor-text' : 'cursor-move'} ${isObjSelected ? 'ring-2 ring-[#7c3aed]' : isMultiSelected ? 'ring-2 ring-[#7c3aed]/60' : 'hover:ring-1 hover:ring-[#7c3aed]/40'}`}
                                                     style={{
@@ -8167,6 +8447,25 @@ export default function VideoEditor() {
                                     </div>
                                 </div>
 
+                                {/* U-40/U-41: вирівнювання та розподіл для мультивиділення */}
+                                {multiSelectedIds.length > 1 && (
+                                    <div className="px-4 py-3 space-y-1.5">
+                                        <span className="text-[10px] font-bold text-slate-400 uppercase">Вирівняти ({multiSelectedIds.length} об'єктів)</span>
+                                        <div className="grid grid-cols-3 gap-1">
+                                            {[['l', 'Ліво'], ['cx', 'Центр'], ['r', 'Право'], ['t', 'Верх'], ['cy', 'Серед.'], ['b', 'Низ']].map(([m, lbl]) => (
+                                                <button key={m} onClick={() => alignSelected(m)}
+                                                    className="px-1 py-1.5 bg-slate-50 hover:bg-violet-50 hover:text-[#7c3aed] border border-slate-200 rounded text-[10px] font-bold text-slate-600 transition-colors">{lbl}</button>
+                                            ))}
+                                        </div>
+                                        {multiSelectedIds.length > 2 && (
+                                            <div className="grid grid-cols-2 gap-1">
+                                                <button onClick={() => alignSelected('distH')} className="px-1 py-1.5 bg-slate-50 hover:bg-violet-50 hover:text-[#7c3aed] border border-slate-200 rounded text-[10px] font-bold text-slate-600 transition-colors" title="Рівні проміжки по горизонталі">↔ Розподілити</button>
+                                                <button onClick={() => alignSelected('distV')} className="px-1 py-1.5 bg-slate-50 hover:bg-violet-50 hover:text-[#7c3aed] border border-slate-200 rounded text-[10px] font-bold text-slate-600 transition-colors" title="Рівні проміжки по вертикалі">↕ Розподілити</button>
+                                            </div>
+                                        )}
+                                    </div>
+                                )}
+
                             </div>
                         )}
 
@@ -8187,6 +8486,13 @@ export default function VideoEditor() {
                                     >
                                         {renderVoiceOptions()}
                                     </select>
+                                    {/* U-63: прослухати зразок обраного голосу */}
+                                    <button
+                                        onClick={() => playVoiceSample(videoVoice.voice)}
+                                        disabled={voiceSampleLoading}
+                                        className="text-[9px] font-bold text-slate-400 hover:text-[#7c3aed] underline underline-offset-2 disabled:opacity-50"
+                                        title="Прослухати, як звучить обраний голос"
+                                    >{voiceSampleLoading ? '…' : '▶ Зразок'}</button>
                                     {/* U-102: словник вимови складних термінів */}
                                     <button
                                         onClick={() => setPronDictOpen(true)}
