@@ -2106,6 +2106,34 @@ const loadJSZip = () => new Promise((res, rej) => {
     document.head.appendChild(script);
 });
 
+// ── Шрифти презентації, яких немає ні серед вбудованих у PPTX, ні в системі:
+// пробуємо підвантажити з Google Fonts (з кирилицею). Якщо і там немає —
+// повертаємо список для чесного повідомлення «показано заміну».
+const __googleFontTried = new Set();
+const ensurePresentationFonts = async (names) => {
+    const missing = [];
+    for (const name of names) {
+        if (!name || name.startsWith('+')) continue;
+        try { if (document.fonts.check(`16px "${name}"`)) continue; } catch (e) { /* ignore */ }
+        if (__googleFontTried.has(name)) { missing.push(name); continue; }
+        __googleFontTried.add(name);
+        try {
+            const fam = encodeURIComponent(name).replace(/%20/g, '+');
+            const link = document.createElement('link');
+            link.rel = 'stylesheet';
+            link.href = `https://fonts.googleapis.com/css2?family=${fam}:ital,wght@0,400;0,700;1,400;1,700&display=swap`;
+            document.head.appendChild(link);
+            await new Promise(r => { link.onload = r; link.onerror = r; setTimeout(r, 3000); });
+            await Promise.race([
+                document.fonts.load(`16px "${name}"`),
+                new Promise(r => setTimeout(r, 3000))
+            ]);
+            if (!document.fonts.check(`16px "${name}"`)) missing.push(name);
+        } catch (e) { missing.push(name); }
+    }
+    return missing;
+};
+
 // Дескриптори FontFace для кожного зрізу вбудованого шрифту PowerPoint
 const EMBED_FONT_SLOTS = {
     regular: { weight: 'normal', style: 'normal' },
@@ -3185,6 +3213,32 @@ const extractPptxData = async (file, onProgress) => {
             }
             logChange('Імпорт', `Відео підготовлено до відтворення: ${videoSrcsToWarm.size}`);
         })();
+    }
+
+    // Точне відтворення шрифтів: усе, що не вбудовано в PPTX і не встановлено
+    // в системі, пробуємо взяти з Google Fonts; про решту — чесний тост
+    if (typeof document !== 'undefined' && document.fonts) {
+        const fontNames = new Set([themeFonts.major, themeFonts.minor].filter(Boolean));
+        for (const sl of extractedSlides) {
+            for (const o of (sl.objects || [])) {
+                for (const l of (o.lines || [])) {
+                    if (l.font) fontNames.add(l.font);
+                    for (const r of (l.runs || [])) if (r.font) fontNames.add(r.font);
+                }
+                for (const row of (o.rows || [])) for (const c of (row.cells || [])) for (const l of (c.lines || [])) for (const r of (l.runs || [])) if (r.font) fontNames.add(r.font);
+            }
+        }
+        (embeddedFontFamilies || []).forEach(f => fontNames.delete(f)); // вбудовані вже живі
+        if (fontNames.size) {
+            ensurePresentationFonts(Array.from(fontNames)).then(missing => {
+                if (missing.length) {
+                    toast('info', `Шрифти без точної копії (показано найближчу заміну): ${missing.slice(0, 4).join(', ')}${missing.length > 4 ? '…' : ''}. Порада: у PowerPoint увімкніть «Файл → Параметри → Зберегти → Вбудовувати шрифти у файл» — тоді збіг буде 100%.`, { duration: 10000 });
+                    logChange('Шрифти', 'Не знайдено точних шрифтів — показано заміну', missing);
+                } else {
+                    logChange('Шрифти', 'Усі шрифти презентації відтворено точно (вбудовані/система/Google Fonts)');
+                }
+            });
+        }
     }
 
     logChange('Імпорт', `Розібрано презентацію: ${extractedSlides.length} слайд(ів)`, {
