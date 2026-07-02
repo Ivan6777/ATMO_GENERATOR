@@ -2106,6 +2106,72 @@ const loadJSZip = () => new Promise((res, rej) => {
     document.head.appendChild(script);
 });
 
+// ── Шрифти презентації, яких немає ні серед вбудованих у PPTX, ні в системі:
+// пробуємо підвантажити з Google Fonts (з кирилицею). Якщо і там немає —
+// повертаємо список для чесного повідомлення «показано заміну».
+const __googleFontTried = new Set();
+const ensurePresentationFonts = async (names) => {
+    const missing = [];
+    for (const name of names) {
+        if (!name || name.startsWith('+')) continue;
+        try { if (document.fonts.check(`16px "${name}"`)) continue; } catch (e) { /* ignore */ }
+        if (__googleFontTried.has(name)) { missing.push(name); continue; }
+        __googleFontTried.add(name);
+        try {
+            const fam = encodeURIComponent(name).replace(/%20/g, '+');
+            const link = document.createElement('link');
+            link.rel = 'stylesheet';
+            link.href = `https://fonts.googleapis.com/css2?family=${fam}:ital,wght@0,400;0,700;1,400;1,700&display=swap`;
+            document.head.appendChild(link);
+            await new Promise(r => { link.onload = r; link.onerror = r; setTimeout(r, 3000); });
+            await Promise.race([
+                document.fonts.load(`16px "${name}"`),
+                new Promise(r => setTimeout(r, 3000))
+            ]);
+            if (!document.fonts.check(`16px "${name}"`)) missing.push(name);
+        } catch (e) { missing.push(name); }
+    }
+    return missing;
+};
+
+// ── Специфічні шрифти прямо з системи користувача (Local Font Access API,
+// Chrome/Edge 103+): з дозволу користувача читаємо встановлені шрифти і
+// піднімаємо всі зрізи (звичайний/жирний/курсив) у document.fonts — точний
+// збіг навіть для комерційних шрифтів, яких немає в Google Fonts.
+const pullFontsFromSystem = async (families) => {
+    try {
+        const wanted = new Set(families.map(f => String(f).toLowerCase()));
+        const all = await window.queryLocalFonts(); // запит дозволу — по кліку користувача
+        const loadedFams = new Set();
+        const seen = new Set();
+        for (const f of all) {
+            const fam = (f.family || '').toLowerCase();
+            if (!wanted.has(fam)) continue;
+            const styleName = (f.style || '').toLowerCase();
+            const weight = styleName.includes('bold') ? 'bold' : 'normal';
+            const style = (styleName.includes('italic') || styleName.includes('oblique')) ? 'italic' : 'normal';
+            const key = fam + '|' + weight + '|' + style;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            try {
+                const blob = await f.blob();
+                const face = new FontFace(f.family, await blob.arrayBuffer(), { weight, style });
+                await face.load();
+                document.fonts.add(face);
+                loadedFams.add(f.family);
+            } catch (e) { /* окремий зріз не прочитався — не критично */ }
+        }
+        const still = families.filter(fm => !Array.from(loadedFams).some(lf => lf.toLowerCase() === String(fm).toLowerCase()));
+        if (loadedFams.size) {
+            toast('success', `Шрифти взято з вашої системи: ${Array.from(loadedFams).join(', ')} — тепер точний збіг (діє у редакторі та у відео)`);
+        }
+        if (still.length) toast('info', `У системі не знайдено: ${still.join(', ')} — лишається заміна`);
+        logChange('Шрифти', 'Підвантажено шрифти з системи користувача', { loaded: Array.from(loadedFams), stillMissing: still });
+    } catch (e) {
+        toast('error', 'Доступ до системних шрифтів не надано або браузер не підтримує (потрібен Chrome/Edge): ' + (e && e.message || e));
+    }
+};
+
 // Дескриптори FontFace для кожного зрізу вбудованого шрифту PowerPoint
 const EMBED_FONT_SLOTS = {
     regular: { weight: 'normal', style: 'normal' },
@@ -3185,6 +3251,42 @@ const extractPptxData = async (file, onProgress) => {
             }
             logChange('Імпорт', `Відео підготовлено до відтворення: ${videoSrcsToWarm.size}`);
         })();
+    }
+
+    // Точне відтворення шрифтів: усе, що не вбудовано в PPTX і не встановлено
+    // в системі, пробуємо взяти з Google Fonts; про решту — чесний тост
+    if (typeof document !== 'undefined' && document.fonts) {
+        const fontNames = new Set([themeFonts.major, themeFonts.minor].filter(Boolean));
+        for (const sl of extractedSlides) {
+            for (const o of (sl.objects || [])) {
+                for (const l of (o.lines || [])) {
+                    if (l.font) fontNames.add(l.font);
+                    for (const r of (l.runs || [])) if (r.font) fontNames.add(r.font);
+                }
+                for (const row of (o.rows || [])) for (const c of (row.cells || [])) for (const l of (c.lines || [])) for (const r of (l.runs || [])) if (r.font) fontNames.add(r.font);
+            }
+        }
+        (embeddedFontFamilies || []).forEach(f => fontNames.delete(f)); // вбудовані вже живі
+        if (fontNames.size) {
+            ensurePresentationFonts(Array.from(fontNames)).then(missing => {
+                if (missing.length) {
+                    const names = missing.slice(0, 4).join(', ') + (missing.length > 4 ? '…' : '');
+                    if (typeof window.queryLocalFonts === 'function') {
+                        // Шрифт специфічний, але ймовірно встановлений у користувача —
+                        // пропонуємо витягти його прямо з системи одним кліком
+                        toast('info', `Шрифти «${names}» не вбудовані у файл. Якщо вони встановлені на цьому комп'ютері — візьму їх звідти для точного збігу.`, {
+                            duration: 15000,
+                            action: { label: 'Взяти з системи', onClick: () => pullFontsFromSystem(missing) }
+                        });
+                    } else {
+                        toast('info', `Шрифти без точної копії (показано найближчу заміну): ${names}. Порада: у PowerPoint увімкніть «Файл → Параметри → Зберегти → Вбудовувати шрифти у файл» — тоді збіг буде 100%.`, { duration: 10000 });
+                    }
+                    logChange('Шрифти', 'Не знайдено точних шрифтів — показано заміну', missing);
+                } else {
+                    logChange('Шрифти', 'Усі шрифти презентації відтворено точно (вбудовані/система/Google Fonts)');
+                }
+            });
+        }
     }
 
     logChange('Імпорт', `Розібрано презентацію: ${extractedSlides.length} слайд(ів)`, {
@@ -4575,6 +4677,14 @@ export default function VideoEditor() {
     const [ctxMenu, setCtxMenu] = useState(null);                    // U-42 {x,y,objId}
     const [exportEta, setExportEta] = useState('');                  // U-23
     const [scenesCollapsed, setScenesCollapsed] = useState(false);   // U-33
+    const [rightCollapsed, setRightCollapsed] = useState(false);     // U-86: права панель теж згортається
+    useEffect(() => { // вузький екран (<=1280px): бокові панелі згортаються самі, канвас лишається читабельним
+        const mq = window.matchMedia('(max-width: 1280px)');
+        const apply = () => { if (mq.matches) { setScenesCollapsed(true); setRightCollapsed(true); } };
+        apply();
+        mq.addEventListener ? mq.addEventListener('change', apply) : mq.addListener(apply);
+        return () => { mq.removeEventListener ? mq.removeEventListener('change', apply) : mq.removeListener(apply); };
+    }, []);
     const [helpOpen, setHelpOpen] = useState(false);                 // U-111
     const cancelGenerationRef = useRef(false);                       // U-69: зупинка пакетної озвучки
     const [tourStep, setTourStep] = useState(null);                  // U-14: тур для новачків (null = вимкнено)
@@ -6002,6 +6112,57 @@ export default function VideoEditor() {
         logChange('Об\'єкт', `Додано бігучий рядок на слайд ${selectedSlide.slideNumber}`);
     };
 
+    // Вставка медіафайлу (відео/зображення) на слайд: з буфера або перетягуванням.
+    // Відео — через blob:-URL (без роздування пам'яті base64-ом), розмір — з метаданих.
+    const insertMediaFileOnSlide = (file, atX, atY) => {
+        if (!selectedSlide || !file) return false;
+        const isVid = /^video\//.test(file.type || '') || /\.(mp4|mov|webm|m4v|ogv)$/i.test(file.name || '');
+        const isImg = /^image\//.test(file.type || '');
+        if (!isVid && !isImg) return false;
+        const place = (w, h, extra) => {
+            const W = Math.min(w, CANVAS_W), H = Math.min(h, CANVAS_H);
+            const x = atX != null ? Math.round(Math.max(0, Math.min(atX - W / 2, CANVAS_W - W))) : Math.round((CANVAS_W - W) / 2);
+            const y = atY != null ? Math.round(Math.max(0, Math.min(atY - H / 2, CANVAS_H - H))) : Math.round((CANVAS_H - H) / 2);
+            const object = {
+                id: crypto.randomUUID(), x, y, w: Math.round(W), h: Math.round(H),
+                animation: { type: 'fadeIn', delay: 0, duration: 0.8 }, ...extra
+            };
+            dispatchVideo({ type: 'ADD_OBJECT', slideId: selectedSlide.id, object });
+            setSelectedObjectId(object.id);
+        };
+        if (isVid) {
+            const src = URL.createObjectURL(file);
+            const probe = document.createElement('video');
+            probe.preload = 'metadata';
+            probe.onloadedmetadata = () => {
+                const vw = probe.videoWidth || 640, vh = probe.videoHeight || 360;
+                const k = Math.min(880 / vw, 500 / vh, 1);
+                place(vw * k, vh * k, { type: 'video', src, videoFitMode: 'loop' });
+                loadVideo(src); // одразу гріємо для прев'ю/експорту
+                toast('success', `Відео «${file.name || 'з буфера'}» додано на слайд`);
+                logChange('Вставка', 'Додано відео (файл/буфер)', { name: file.name, size: file.size });
+            };
+            probe.onerror = () => {
+                place(640, 360, { type: 'video', src, videoFitMode: 'loop' });
+                toast('info', 'Відео додано (розмір типовий — метадані не прочитались)');
+            };
+            probe.src = src;
+            return true;
+        }
+        const rd = new FileReader();
+        rd.onload = (ev) => {
+            const img = new Image();
+            img.onload = () => {
+                const k = Math.min(880 / img.width, 500 / img.height, 1);
+                place(img.width * k, img.height * k, { type: 'image', src: ev.target.result });
+                toast('success', `Зображення «${file.name || 'з буфера'}» додано`);
+            };
+            img.src = ev.target.result;
+        };
+        rd.readAsDataURL(file);
+        return true;
+    };
+
     const addTextObject = () => {
         if (!selectedSlide) return;
         const object = {
@@ -6123,11 +6284,13 @@ export default function VideoEditor() {
 
             // Спробуємо витягти розміри та позицію з HTML (якщо скопійовано з PowerPoint чи іншого редактора)
             let pptxRect = null;
+            let pastedHtmlDoc = null; // розібраний HTML буфера — для вставки ТЕКСТУ зі стилями
             try {
                 const htmlData = e.clipboardData.getData('text/html');
                 if (htmlData) {
                     const parser = new DOMParser();
                     const doc = parser.parseFromString(htmlData, 'text/html');
+                    pastedHtmlDoc = doc;
 
                     const tryParse = (val) => {
                         if (!val) return null;
@@ -6165,6 +6328,21 @@ export default function VideoEditor() {
                 }
             } catch (err) { }
 
+            // Текстовий блок PowerPoint = text/html З ТЕКСТОМ + PNG-рендер у items.
+            // Якщо в HTML є справжній текст — вставляємо ТЕКСТ, а не його картинку.
+            const htmlText = pastedHtmlDoc ? (pastedHtmlDoc.body.textContent || '').trim() : '';
+            const hasHtmlText = htmlText.length > 0;
+
+            // Файли в буфері (копіювання з провідника/Finder): відео та зображення
+            const cbFiles = (e.clipboardData && e.clipboardData.files) || [];
+            for (const f of cbFiles) {
+                if (/^video\//.test(f.type || '')) {
+                    e.preventDefault();
+                    insertMediaFileOnSlide(f, null, null);
+                    return;
+                }
+            }
+
             const items = (e.clipboardData && e.clipboardData.items) || [];
             for (const it of items) {
                 if (it.type && it.type.indexOf('video') === 0) {
@@ -6194,6 +6372,7 @@ export default function VideoEditor() {
                     }
                 }
                 if (it.type && it.type.indexOf('image') === 0) {
+                    if (hasHtmlText) continue; // це PNG-рендер текстового блока — вставимо текст нижче
                     const file = it.getAsFile();
                     if (file) {
                         e.preventDefault();
@@ -6230,6 +6409,87 @@ export default function VideoEditor() {
                     }
                 }
             }
+
+            // ── Вставка ТЕКСТУ з PowerPoint: аналогічний розмір, кегль, колір, стилі ──
+            const plainText = e.clipboardData.getData('text/plain');
+            if (!hasHtmlText && !plainText.trim()) return;
+            e.preventDefault();
+            // pt -> px канваса: слайд 13.33in x 7.5in = 1280x720 => рівно 96dpi
+            const cssToPx = (v) => {
+                if (!v) return null;
+                const m = String(v).match(/([\d.]+)\s*(pt|px|in|em)?/);
+                if (!m) return null;
+                const n = parseFloat(m[1]);
+                if (!isFinite(n) || n <= 0) return null;
+                const u = m[2] || 'px';
+                return u === 'pt' ? n * 96 / 72 : (u === 'in' ? n * 96 : (u === 'em' ? n * 16 : n));
+            };
+            let lines = [];
+            if (hasHtmlText) {
+                // Абзаци — «листові» блоки; стилі збираються вглиб по спанах
+                const blocks = Array.from(pastedHtmlDoc.body.querySelectorAll('p, li, div, h1, h2, h3'))
+                    .filter(el => el.textContent.trim() && !el.querySelector('p, li, div, h1, h2, h3'));
+                const roots = blocks.length ? blocks : [pastedHtmlDoc.body];
+                for (const para of roots) {
+                    const runs = [];
+                    const walk = (node, inh) => {
+                        if (node.nodeType === 3) {
+                            const t = node.textContent.replace(/\s+/g, ' ');
+                            if (t) runs.push({ ...inh, text: t });
+                            return;
+                        }
+                        if (node.nodeType !== 1) return;
+                        const st = node.style || {};
+                        const fw = st.fontWeight || '';
+                        const next = {
+                            ...inh,
+                            fontSize: Math.round(cssToPx(st.fontSize) || inh.fontSize),
+                            color: (st.color && st.color !== 'inherit' ? st.color : null) || inh.color,
+                            bold: fw === 'bold' || parseInt(fw, 10) >= 600 || ['B', 'STRONG'].includes(node.tagName) || inh.bold,
+                            italic: st.fontStyle === 'italic' || ['I', 'EM'].includes(node.tagName) || inh.italic,
+                            underline: (st.textDecoration || '').includes('underline') || node.tagName === 'U' || inh.underline,
+                            font: ((st.fontFamily || '').split(',')[0] || '').replace(/["']/g, '').trim() || inh.font
+                        };
+                        node.childNodes.forEach(ch => walk(ch, next));
+                    };
+                    walk(para, { fontSize: 24, color: '#1e293b', bold: false, italic: false, underline: false, font: null });
+                    const clean = runs.filter(r => r.text.trim());
+                    if (!clean.length) continue;
+                    const ta = (para.style && para.style.textAlign) || '';
+                    lines.push({
+                        text: clean.map(r => r.text).join('').trim(),
+                        runs: clean,
+                        color: clean[0].color,
+                        fontSize: Math.max(...clean.map(r => r.fontSize)),
+                        bold: clean[0].bold, italic: clean[0].italic,
+                        align: ta === 'center' ? 'ctr' : (ta === 'right' ? 'r' : 'l'),
+                        indent: 0, lineSpacing: 1
+                    });
+                }
+            }
+            if (!lines.length) { // фолбек: простий текст рядками
+                lines = plainText.split('\n').filter(t => t.trim()).map(t => ({
+                    text: t.trim(), runs: undefined, color: '#1e293b', fontSize: 24,
+                    bold: false, italic: false, align: 'l', indent: 0, lineSpacing: 1
+                }));
+            }
+            if (!lines.length) return;
+            // Розмір і позиція: з HTML PowerPoint (pt -> px 1:1 до канваса), інакше — за вмістом
+            const estH = lines.reduce((a, l) => a + (l.fontSize || 24) * 1.35, 0) + 16;
+            const tw = (pptxRect && pptxRect.w && isFinite(pptxRect.w)) ? Math.min(pptxRect.w, CANVAS_W) : Math.min(760, CANVAS_W - 160);
+            const th = (pptxRect && pptxRect.h && isFinite(pptxRect.h)) ? Math.min(pptxRect.h, CANVAS_H) : Math.min(Math.max(estH, 60), CANVAS_H - 80);
+            const txp = (pptxRect && pptxRect.x != null && isFinite(pptxRect.x)) ? pptxRect.x : Math.round((CANVAS_W - tw) / 2);
+            const typ = (pptxRect && pptxRect.y != null && isFinite(pptxRect.y)) ? pptxRect.y : Math.round((CANVAS_H - th) / 2);
+            const textObject = {
+                id: crypto.randomUUID(), type: 'text',
+                x: Math.round(txp), y: Math.round(typ), w: Math.round(tw), h: Math.round(th),
+                fillColor: null, lineColor: null, vAlign: 't', lines,
+                animation: { type: 'fadeIn', delay: 0, duration: 0.8 }
+            };
+            dispatchVideo({ type: 'ADD_OBJECT', slideId: selectedSlide.id, object: textObject });
+            setSelectedObjectId(textObject.id);
+            toast('success', `Вставлено текст (${lines.length} рядк.) зі стилями PowerPoint`);
+            logChange('Вставка', 'Вставлено текст з буфера (PowerPoint) зі стилями та розміром');
         };
         window.addEventListener('paste', onPaste);
         return () => window.removeEventListener('paste', onPaste);
@@ -8852,6 +9112,22 @@ export default function VideoEditor() {
                                     <div
                                         ref={workspaceRef}
                                         onMouseDown={(e) => { if (e.target === e.currentTarget && !interactiveMode) startMarquee(e); }}
+                                        onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; }}
+                                        onDrop={(e) => {
+                                            // Перетягніть відео/зображення-файл на слайд — вставиться в точці кидання.
+                                            // (Відео з буфера PowerPoint браузер не віддає — лише постер; тому файл.)
+                                            const fl = e.dataTransfer && e.dataTransfer.files;
+                                            if (!fl || !fl.length) return;
+                                            e.preventDefault(); e.stopPropagation();
+                                            const host = workspaceRef.current ? workspaceRef.current.getBoundingClientRect() : null;
+                                            const sc = editorScaleRef.current || 1;
+                                            const ax = host ? (e.clientX - host.left) / sc : null;
+                                            const ay = host ? (e.clientY - host.top) / sc : null;
+                                            for (const f of Array.from(fl)) {
+                                                if (insertMediaFileOnSlide(f, ax, ay)) return;
+                                            }
+                                            toast('info', 'Перетягніть відео (MP4/MOV/WebM) або зображення');
+                                        }}
                                         className="relative rounded-md shadow-2xl overflow-hidden"
                                         style={{
                                             width: '100%',
@@ -9399,9 +9675,17 @@ export default function VideoEditor() {
                         )}
                     </div>
 
-                    {/* ── ПРАВА ПАНЕЛЬ: властивості сцени ── */}
-                    <div className="w-[280px] flex-shrink-0 bg-white border-l border-slate-200 overflow-y-auto">
-                        {vSlide ? (
+                    {/* ── ПРАВА ПАНЕЛЬ: властивості сцени (U-86: згортається) ── */}
+                    <div className={`${rightCollapsed ? 'w-7' : 'w-[280px]'} flex-shrink-0 bg-white border-l border-slate-200 overflow-y-auto transition-all`}>
+                        <button
+                            onClick={() => setRightCollapsed(c => !c)}
+                            aria-label={rightCollapsed ? 'Розгорнути панель властивостей' : 'Згорнути панель властивостей'}
+                            title={rightCollapsed ? 'Розгорнути властивості' : 'Згорнути властивості'}
+                            className="w-full h-6 flex items-center justify-center text-slate-400 hover:text-[#7c3aed] hover:bg-slate-50"
+                        >
+                            {rightCollapsed ? '«' : '»'}
+                        </button>
+                        {!rightCollapsed && (vSlide ? (
                             <div className="divide-y divide-slate-100">
                                 {/* Заголовок */}
                                 <div className="px-4 py-3 flex items-center justify-between">
@@ -10150,7 +10434,7 @@ export default function VideoEditor() {
                             <div className="p-4 text-center text-slate-400 text-xs mt-8">
                                 Оберіть сцену зліва
                             </div>
-                        )}
+                        ))}
                     </div>
                 </div>
                 </UIErrorBoundary>
