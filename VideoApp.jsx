@@ -4575,6 +4575,14 @@ export default function VideoEditor() {
     const [ctxMenu, setCtxMenu] = useState(null);                    // U-42 {x,y,objId}
     const [exportEta, setExportEta] = useState('');                  // U-23
     const [scenesCollapsed, setScenesCollapsed] = useState(false);   // U-33
+    const [rightCollapsed, setRightCollapsed] = useState(false);     // U-86: права панель теж згортається
+    useEffect(() => { // вузький екран (<=1280px): бокові панелі згортаються самі, канвас лишається читабельним
+        const mq = window.matchMedia('(max-width: 1280px)');
+        const apply = () => { if (mq.matches) { setScenesCollapsed(true); setRightCollapsed(true); } };
+        apply();
+        mq.addEventListener ? mq.addEventListener('change', apply) : mq.addListener(apply);
+        return () => { mq.removeEventListener ? mq.removeEventListener('change', apply) : mq.removeListener(apply); };
+    }, []);
     const [helpOpen, setHelpOpen] = useState(false);                 // U-111
     const cancelGenerationRef = useRef(false);                       // U-69: зупинка пакетної озвучки
     const [tourStep, setTourStep] = useState(null);                  // U-14: тур для новачків (null = вимкнено)
@@ -9310,9 +9318,17 @@ export default function VideoEditor() {
                         )}
                     </div>
 
-                    {/* ── ПРАВА ПАНЕЛЬ: властивості сцени ── */}
-                    <div className="w-[280px] flex-shrink-0 bg-white border-l border-slate-200 overflow-y-auto">
-                        {vSlide ? (
+                    {/* ── ПРАВА ПАНЕЛЬ: властивості сцени (U-86: згортається) ── */}
+                    <div className={`${rightCollapsed ? 'w-7' : 'w-[280px]'} flex-shrink-0 bg-white border-l border-slate-200 overflow-y-auto transition-all`}>
+                        <button
+                            onClick={() => setRightCollapsed(c => !c)}
+                            aria-label={rightCollapsed ? 'Розгорнути панель властивостей' : 'Згорнути панель властивостей'}
+                            title={rightCollapsed ? 'Розгорнути властивості' : 'Згорнути властивості'}
+                            className="w-full h-6 flex items-center justify-center text-slate-400 hover:text-[#7c3aed] hover:bg-slate-50"
+                        >
+                            {rightCollapsed ? '«' : '»'}
+                        </button>
+                        {!rightCollapsed && (vSlide ? (
                             <div className="divide-y divide-slate-100">
                                 {/* Заголовок */}
                                 <div className="px-4 py-3 flex items-center justify-between">
@@ -10061,7 +10077,7 @@ export default function VideoEditor() {
                             <div className="p-4 text-center text-slate-400 text-xs mt-8">
                                 Оберіть сцену зліва
                             </div>
-                        )}
+                        ))}
                     </div>
                 </div>
                 </UIErrorBoundary>
