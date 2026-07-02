@@ -2134,6 +2134,44 @@ const ensurePresentationFonts = async (names) => {
     return missing;
 };
 
+// ── Специфічні шрифти прямо з системи користувача (Local Font Access API,
+// Chrome/Edge 103+): з дозволу користувача читаємо встановлені шрифти і
+// піднімаємо всі зрізи (звичайний/жирний/курсив) у document.fonts — точний
+// збіг навіть для комерційних шрифтів, яких немає в Google Fonts.
+const pullFontsFromSystem = async (families) => {
+    try {
+        const wanted = new Set(families.map(f => String(f).toLowerCase()));
+        const all = await window.queryLocalFonts(); // запит дозволу — по кліку користувача
+        const loadedFams = new Set();
+        const seen = new Set();
+        for (const f of all) {
+            const fam = (f.family || '').toLowerCase();
+            if (!wanted.has(fam)) continue;
+            const styleName = (f.style || '').toLowerCase();
+            const weight = styleName.includes('bold') ? 'bold' : 'normal';
+            const style = (styleName.includes('italic') || styleName.includes('oblique')) ? 'italic' : 'normal';
+            const key = fam + '|' + weight + '|' + style;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            try {
+                const blob = await f.blob();
+                const face = new FontFace(f.family, await blob.arrayBuffer(), { weight, style });
+                await face.load();
+                document.fonts.add(face);
+                loadedFams.add(f.family);
+            } catch (e) { /* окремий зріз не прочитався — не критично */ }
+        }
+        const still = families.filter(fm => !Array.from(loadedFams).some(lf => lf.toLowerCase() === String(fm).toLowerCase()));
+        if (loadedFams.size) {
+            toast('success', `Шрифти взято з вашої системи: ${Array.from(loadedFams).join(', ')} — тепер точний збіг (діє у редакторі та у відео)`);
+        }
+        if (still.length) toast('info', `У системі не знайдено: ${still.join(', ')} — лишається заміна`);
+        logChange('Шрифти', 'Підвантажено шрифти з системи користувача', { loaded: Array.from(loadedFams), stillMissing: still });
+    } catch (e) {
+        toast('error', 'Доступ до системних шрифтів не надано або браузер не підтримує (потрібен Chrome/Edge): ' + (e && e.message || e));
+    }
+};
+
 // Дескриптори FontFace для кожного зрізу вбудованого шрифту PowerPoint
 const EMBED_FONT_SLOTS = {
     regular: { weight: 'normal', style: 'normal' },
@@ -3232,7 +3270,17 @@ const extractPptxData = async (file, onProgress) => {
         if (fontNames.size) {
             ensurePresentationFonts(Array.from(fontNames)).then(missing => {
                 if (missing.length) {
-                    toast('info', `Шрифти без точної копії (показано найближчу заміну): ${missing.slice(0, 4).join(', ')}${missing.length > 4 ? '…' : ''}. Порада: у PowerPoint увімкніть «Файл → Параметри → Зберегти → Вбудовувати шрифти у файл» — тоді збіг буде 100%.`, { duration: 10000 });
+                    const names = missing.slice(0, 4).join(', ') + (missing.length > 4 ? '…' : '');
+                    if (typeof window.queryLocalFonts === 'function') {
+                        // Шрифт специфічний, але ймовірно встановлений у користувача —
+                        // пропонуємо витягти його прямо з системи одним кліком
+                        toast('info', `Шрифти «${names}» не вбудовані у файл. Якщо вони встановлені на цьому комп'ютері — візьму їх звідти для точного збігу.`, {
+                            duration: 15000,
+                            action: { label: 'Взяти з системи', onClick: () => pullFontsFromSystem(missing) }
+                        });
+                    } else {
+                        toast('info', `Шрифти без точної копії (показано найближчу заміну): ${names}. Порада: у PowerPoint увімкніть «Файл → Параметри → Зберегти → Вбудовувати шрифти у файл» — тоді збіг буде 100%.`, { duration: 10000 });
+                    }
                     logChange('Шрифти', 'Не знайдено точних шрифтів — показано заміну', missing);
                 } else {
                     logChange('Шрифти', 'Усі шрифти презентації відтворено точно (вбудовані/система/Google Fonts)');
