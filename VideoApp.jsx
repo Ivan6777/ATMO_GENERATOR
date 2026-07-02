@@ -609,6 +609,7 @@ const H5P_TYPES = [
     ['fill', 'Заповни пропуск', '▭'],
     ['summary', 'Обери правильне', '✓'],
     ['hotspot', 'Гаряча точка', '◉'],
+    ['fact', 'Цікавий факт (фото+текст)', '★'],
     ['info', 'Інфо-блок', 'ℹ'],
     ['accordion', 'Акордеон', '≡'],
     ['flashcard', 'Картка (фліп)', '⇄'],
@@ -626,8 +627,20 @@ const InteractiveWidget = ({ obj, scale, interactive }) => {
     const pe = interactive ? 'auto' : 'none';
     const stop = (e) => { if (interactive) e.stopPropagation(); };
     const card = { borderColor: accent, pointerEvents: pe, fontSize: fs };
+    const [dotOpen, setDotOpen] = React.useState(false);
 
+    const renderBody = () => {
     switch (obj.iType) {
+        case 'fact': // Цікавий факт: картинка + заголовок + текст
+            return (
+                <div className="w-full h-full bg-white rounded-xl shadow-xl border-2 overflow-hidden flex flex-col" style={card} onMouseDown={stop}>
+                    {obj.image && <img src={obj.image} alt="" className="w-full object-cover" style={{ maxHeight: '55%' }} draggable={false} />}
+                    <div className="p-2 overflow-y-auto">
+                        <div className="font-bold" style={{ color: accent }}>★ {obj.title || 'Цікавий факт'}</div>
+                        <div className="text-slate-700 mt-1 whitespace-pre-wrap">{obj.content || ''}</div>
+                    </div>
+                </div>
+            );
         case 'hotspot':
             return (
                 <div className="w-full h-full relative" style={{ pointerEvents: pe }}>
@@ -725,6 +738,43 @@ const InteractiveWidget = ({ obj, scale, interactive }) => {
                 </button>
             );
     }
+    };
+
+    // ── H5P-стиль (Interactive Video): у режимі перегляду КОЖЕН інтерактив —
+    // пульсуюча точка поверх відео/слайда; клік розкриває вміст (тест, факт,
+    // картку...), ✕ згортає назад у точку. Гарячі точки/кнопки — і так точки.
+    if (interactive && obj.iType !== 'hotspot' && obj.iType !== 'link') {
+        if (!dotOpen) {
+            const icon = (H5P_TYPES.find(t => t[0] === obj.iType) || [null, null, '☑'])[2];
+            return (
+                <div className="w-full h-full relative" style={{ pointerEvents: 'auto' }}>
+                    <button
+                        onClick={(e) => { e.stopPropagation(); setDotOpen(true); }}
+                        aria-label="Відкрити інтерактив"
+                        title={(H5P_TYPES.find(t => t[0] === obj.iType) || [null, 'Інтерактив'])[1]}
+                        className="absolute rounded-full flex items-center justify-center text-white font-extrabold shadow-lg"
+                        style={{
+                            left: '50%', top: '50%', transform: 'translate(-50%, -50%)',
+                            width: Math.max(34, 44 * scale), height: Math.max(34, 44 * scale),
+                            background: accent, fontSize: Math.max(15, 20 * scale),
+                            animation: 'pulse 1.6s infinite', border: '3px solid rgba(255,255,255,0.85)'
+                        }}
+                    >{icon}</button>
+                </div>
+            );
+        }
+        return (
+            <div className="w-full h-full relative" style={{ pointerEvents: 'auto' }} onMouseDown={stop}>
+                {renderBody()}
+                <button
+                    onClick={(e) => { e.stopPropagation(); setDotOpen(false); }}
+                    aria-label="Згорнути інтерактив у точку"
+                    className="absolute -top-2 -right-2 w-6 h-6 rounded-full bg-slate-800 hover:bg-slate-900 text-white text-xs font-bold shadow z-20"
+                >✕</button>
+            </div>
+        );
+    }
+    return renderBody();
 };
 
 /* ============================================================================
@@ -3625,6 +3675,9 @@ const drawObject = (ctx, obj, state, time = 0) => {
             cardBg(true);
             const shown = String(obj.text || '').replace(/\*[^*]+\*/g, '_____');
             drawTextBlock(ctx, [run(shown, '#1e293b', 18)], obj.w, obj.h, 'ctr', 14, 12, true);
+        } else if (obj.iType === 'fact') {
+            cardBg(true);
+            drawTextBlock(ctx, [run('★ ' + (obj.title || 'Цікавий факт'), accent, 20, true), run(obj.content || '', '#334155', 16)], obj.w, obj.h, 't', 14, 12, true);
         } else if (obj.iType === 'info') {
             cardBg(false);
             ctx.fillStyle = accent; ctx.fillRect(0, 0, 5, obj.h);
@@ -5910,6 +5963,7 @@ export default function VideoEditor() {
         const base = { id: crypto.randomUUID(), type: 'interactive', iType, color: '#7c3aed', x: 320, y: 240, animation: { type: 'none', delay: 0, duration: 0.5 } };
         const D = {
             hotspot: { x: 600, y: 320, w: 56, h: 56, label: 'i', content: 'Текст підказки' },
+            fact: { x: 420, y: 180, w: 440, h: 300, title: 'Цікавий факт', content: 'Додайте текст факту, а вище — картинку.', image: null },
             mcq: { w: 460, h: 230, question: 'Ваше питання?', options: ['Варіант 1', 'Варіант 2', 'Варіант 3'], correct: 0 },
             summary: { w: 460, h: 230, question: 'Оберіть правильне твердження:', options: ['Хибне твердження', 'Правильне твердження', 'Ще одне хибне'], correct: 1 },
             truefalse: { w: 420, h: 150, question: 'Це твердження правдиве?', correct: true },
@@ -9039,6 +9093,27 @@ export default function VideoEditor() {
                                                     <>
                                                         <input value={selectedObject.label || ''} onChange={(e) => dispatchVideo({ type: 'UPDATE_OBJECT', slideId: vSlide.id, objectId: selectedObject.id, updates: { label: e.target.value } })} placeholder="Мітка (напр. i, ?)" className="w-full text-xs border border-slate-200 rounded px-2 py-1 outline-none focus:border-[#7c3aed]" />
                                                         <textarea value={selectedObject.content || ''} onChange={(e) => dispatchVideo({ type: 'UPDATE_OBJECT', slideId: vSlide.id, objectId: selectedObject.id, updates: { content: e.target.value } })} placeholder="Текст підказки" className="w-full text-xs border border-slate-200 rounded px-2 py-1 outline-none focus:border-[#7c3aed] resize-y min-h-[56px]" />
+                                                    </>
+                                                )}
+                                                {selectedObject.iType === 'fact' && (
+                                                    <>
+                                                        <input value={selectedObject.title || ''} onChange={(e) => dispatchVideo({ type: 'UPDATE_OBJECT', slideId: vSlide.id, objectId: selectedObject.id, updates: { title: e.target.value } })} placeholder="Заголовок факту" className="w-full text-xs border border-slate-200 rounded px-2 py-1 outline-none focus:border-[#7c3aed]" />
+                                                        <textarea value={selectedObject.content || ''} onChange={(e) => dispatchVideo({ type: 'UPDATE_OBJECT', slideId: vSlide.id, objectId: selectedObject.id, updates: { content: e.target.value } })} placeholder="Текст цікавого факту" className="w-full text-xs border border-slate-200 rounded px-2 py-1 outline-none focus:border-[#7c3aed] resize-y min-h-[64px]" />
+                                                        <label className="w-full text-[10px] font-bold text-violet-600 hover:text-violet-800 cursor-pointer flex items-center gap-1">
+                                                            🖼 {selectedObject.image ? 'Замінити картинку' : 'Додати картинку'}
+                                                            <input type="file" accept="image/*" className="hidden" onChange={(e) => {
+                                                                const f = e.target.files && e.target.files[0];
+                                                                if (!f) return;
+                                                                const rd = new FileReader();
+                                                                rd.onload = (ev) => dispatchVideo({ type: 'UPDATE_OBJECT', slideId: vSlide.id, objectId: selectedObject.id, updates: { image: ev.target.result } });
+                                                                rd.readAsDataURL(f);
+                                                                e.target.value = '';
+                                                            }} />
+                                                        </label>
+                                                        {selectedObject.image && (
+                                                            <button onClick={() => dispatchVideo({ type: 'UPDATE_OBJECT', slideId: vSlide.id, objectId: selectedObject.id, updates: { image: null } })} className="text-[10px] font-bold text-red-400 hover:text-red-600">✕ прибрати картинку</button>
+                                                        )}
+                                                        <p className="text-[9px] text-slate-400">У режимі перегляду факт показується ★-точкою — клік розкриває картку з фото і текстом.</p>
                                                     </>
                                                 )}
                                                 {selectedObject.iType === 'link' && (
