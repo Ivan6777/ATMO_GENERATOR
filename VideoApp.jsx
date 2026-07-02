@@ -934,6 +934,75 @@ const indexOfBytes = (hay, needle, from = 0) => {
     return -1;
 };
 
+// ── Серіалізація проєкту для вшивання в MP4 (зворотна конвертація) ──
+// blob:-URL відео/аудіо живуть лише до перезавантаження сторінки, тому у знімок
+// вони вшиваються як data:-URL (base64). Без цього відкритий назад MP4 містив
+// мертві посилання: відео зникали і з редактора, і з повторного експорту.
+const serializeSlidesForEmbed = async (slides) => {
+    const cache = new Map(); // blob:-URL -> data:-URL (одне відео може бути на кількох слайдах)
+    const out = [];
+    for (const s of slides) {
+        const objects = [];
+        for (const o of (s.objects || [])) {
+            if ((o.type === 'video' || o.type === 'audio') && o.src && o.src.startsWith('blob:')) {
+                let dataUrl = cache.get(o.src);
+                if (dataUrl === undefined) {
+                    try {
+                        const blob = await fetch(o.src).then(r => r.blob());
+                        dataUrl = await new Promise((res, rej) => {
+                            const fr = new FileReader();
+                            fr.onload = () => res(fr.result);
+                            fr.onerror = () => rej(fr.error);
+                            fr.readAsDataURL(blob);
+                        });
+                    } catch (e) { dataUrl = null; }
+                    cache.set(o.src, dataUrl);
+                }
+                objects.push({ ...o, src: dataUrl });
+            } else {
+                objects.push(o);
+            }
+        }
+        out.push({ ...s, objects, isGenerating: false });
+    }
+    return out;
+};
+
+// Оживлення знімка після зворотної конвертації: data:-URL медіа -> свіжі blob:-URL
+// (ефективніше для <video> і canvas), мертві blob: зі старих експортів -> null.
+// Повертає { slides, deadMedia } — кількість відео, які відновити неможливо.
+const reviveEmbeddedSlides = (snapshotSlides) => {
+    let deadMedia = 0;
+    const cache = new Map(); // data:-URL -> blob:-URL
+    const slides = snapshotSlides.map(s => ({
+        ...s,
+        isGenerating: false,
+        objects: (s.objects || []).map(o => {
+            if ((o.type === 'video' || o.type === 'audio') && typeof o.src === 'string') {
+                if (o.src.startsWith('data:')) {
+                    let url = cache.get(o.src);
+                    if (url === undefined) {
+                        try {
+                            const comma = o.src.indexOf(',');
+                            const mime = (o.src.slice(5, comma).split(';')[0]) || 'video/mp4';
+                            const bin = atob(o.src.slice(comma + 1));
+                            const bytes = new Uint8Array(bin.length);
+                            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+                            url = URL.createObjectURL(new Blob([bytes], { type: mime }));
+                        } catch (e) { url = null; }
+                        cache.set(o.src, url);
+                    }
+                    if (!url) deadMedia++;
+                    return { ...o, src: url };
+                }
+                if (o.src.startsWith('blob:')) { deadMedia++; return { ...o, src: null }; } // старий експорт
+            }
+            return o;
+        })
+    }));
+    return { slides, deadMedia };
+};
+
 // Кольори теми Office за замовчуванням — перезаписуються темою конкретної презентації
 const DEFAULT_THEME_COLORS = {
     dk1: '#000000', lt1: '#FFFFFF', dk2: '#44546A', lt2: '#E7E6E6',
@@ -2539,11 +2608,17 @@ const extractPptxData = async (file, onProgress) => {
 
                 // --- mc:AlternateContent: беремо Fallback (інакше перший Choice) і парсимо його ---
                 // Так не пропускаємо елементи, загорнуті в AlternateContent (SmartArt, нові фігури тощо).
-                // Виняток — формули (Requires="a14"): справжній OMML живе у Choice,
-                // а Fallback містить лише растрову картинку рівняння.
+                // Винятки, де справжній вміст живе у Choice:
+                //  - формули (Requires="a14") — Fallback містить лише картинку рівняння;
+                //  - ВІДЕО/АУДІО (Requires="p14") — сучасний PowerPoint загортає медіа
+                //    саме так, і Fallback — це статична картинка-постер. Без цього
+                //    відео слайда імпортувалось як нерухоме зображення.
                 if (tag === 'mc:AlternateContent' || node.localName === 'AlternateContent') {
                     const acChildren = Array.from(node.children);
+                    const hasMedia = (el) => Array.from(el.getElementsByTagName('*'))
+                        .some(e => e.localName === 'videoFile' || e.localName === 'audioFile');
                     const pick = acChildren.find(c => c.localName === 'Choice' && findOMaths(c).length)
+                        || acChildren.find(c => c.localName === 'Choice' && hasMedia(c))
                         || acChildren.find(c => c.localName === 'Fallback')
                         || acChildren.find(c => c.localName === 'Choice');
                     if (pick) {
@@ -6089,9 +6164,11 @@ export default function VideoEditor() {
             const videoBlob = new Blob(chunks, { type: mimeType });
             // Вшиваємо проєкт у кінець файлу (маркер + base64 JSON), щоб MP4 можна було
             // відкрити НАЗАД у редакторі (зворотна конвертація). Плеєри ігнорують хвіст.
+            // Медіа (відео/аудіо) вшиваються як data:-URL — blob:-посилання не
+            // переживають перезавантаження сторінки.
             let finalBlob = videoBlob;
             try {
-                const snapshot = { studioProVideo: 1, exportedAt: Date.now(), slides };
+                const snapshot = { studioProVideo: 2, exportedAt: Date.now(), slides: await serializeSlidesForEmbed(slides) };
                 const b64 = btoa(unescape(encodeURIComponent(JSON.stringify(snapshot))));
                 finalBlob = new Blob([videoBlob, `\n${VIDEO_PROJECT_START}\n${b64}\n${VIDEO_PROJECT_END}\n`], { type: mimeType });
             } catch (e) {
@@ -6220,10 +6297,21 @@ export default function VideoEditor() {
             const b64 = new TextDecoder('latin1').decode(buf.slice(dataStart, dataEnd)).trim();
             const snapshot = JSON.parse(decodeURIComponent(escape(atob(b64))));
             if (!snapshot.slides || !snapshot.slides.length) throw new Error('Вшиті дані проєкту порожні або пошкоджені.');
-            dispatchVideo({ type: 'SET_SLIDES', slides: snapshot.slides });
-            setSelectedSlideId(snapshot.slides[0]?.id || null);
+            // Оживляємо медіа: data:-URL -> blob:-URL; мертві blob: зі старих експортів -> попередження
+            const { slides: revivedSlides, deadMedia } = reviveEmbeddedSlides(snapshot.slides);
+            dispatchVideo({ type: 'SET_SLIDES', slides: revivedSlides });
+            setSelectedSlideId(revivedSlides[0]?.id || null);
             setSelectedObjectId(null);
-            logChange('Імпорт', `Відкрито відео для редагування: "${file.name}"`, { slides: snapshot.slides.length });
+            if (deadMedia > 0) {
+                toast('error', `Не вдалося відновити ${deadMedia} відео/аудіо: файл експортовано старішою версією редактора. Переекспортуйте проєкт із поточної версії.`, { duration: 9000 });
+            }
+            // Прогріваємо відновлені відео, щоб прев'ю та експорт стартували миттєво
+            const revivedSrcs = new Set();
+            for (const s of revivedSlides) for (const o of (s.objects || [])) {
+                if ((o.type === 'video' || o.type === 'audio') && o.src) revivedSrcs.add(o.src);
+            }
+            (async () => { for (const src of Array.from(revivedSrcs)) { try { await loadVideo(src); } catch (e) { /* ignore */ } } })();
+            logChange('Імпорт', `Відкрито відео для редагування: "${file.name}"`, { slides: revivedSlides.length, deadMedia });
         } catch (err) {
             setFileError('Зворотна конвертація: ' + err.message);
             logChange('Помилка', 'Не вдалося відкрити відео для редагування', err.message);
