@@ -216,7 +216,7 @@ const loadProjectSnapshot = async () => {
             }
             slides.push({ ...s, objects });
         }
-        return { slides, savedAt: snap.savedAt, cover: snap.cover || null, subtitles: snap.subtitles || null };
+        return { slides, savedAt: snap.savedAt, cover: snap.cover || null, subtitles: snap.subtitles || null, slideHold: (typeof snap.slideHold === 'number' ? snap.slideHold : null) };
     } catch (e) {
         return null;
     }
@@ -4305,6 +4305,15 @@ const getTransitionDuration = (slide) => {
         : base;
 };
 
+// Базова затримка (витримка) між слайдами: пауза наприкінці КОЖНОГО слайда
+// після озвучки/анімацій, щоб глядач встиг роздивитись кадр перед переходом.
+// Спільна для всієї презентації, редагується у панелі слайда (0–10с, типово 3с).
+// Модульний об'єкт (як SUBTITLE_SETTINGS) — його читають усі обчислення
+// тривалості: прев'ю, обидва експорти, ETA, таймлайн.
+const SLIDE_HOLD_SETTINGS = { seconds: 3 };
+const DEFAULT_SLIDE_HOLD_SEC = 3;
+const getSlideHold = () => Math.max(0, Math.min(Number(SLIDE_HOLD_SETTINGS.seconds) || 0, 10));
+
 const getSlideDuration = (slide) => {
     const animEnd = (slide.objects || []).reduce((m, o) => {
         const a = o.animation;
@@ -4326,7 +4335,8 @@ const getSlideDuration = (slide) => {
     const base = (slide.audioBase64 && slide.audioDuration > 0)
         ? Math.max(slide.audioDuration + 0.5, animEnd + 0.5)
         : Math.max(3, animEnd + 1);
-    return Math.max(base, mediaEnd + 0.3);
+    // + базова затримка між слайдами (глобальна, регульована)
+    return Math.max(base, mediaEnd + 0.3) + getSlideHold();
 };
 
 /* ============================================================================
@@ -4728,11 +4738,23 @@ export default function VideoEditor() {
         SUBTITLE_SETTINGS.size = subtitleSize;
         try { localStorage.setItem('subtitles_on', subtitlesOn ? '1' : '0'); localStorage.setItem('subtitles_size', subtitleSize); } catch (e) { /* приватний режим */ }
     }, [subtitlesOn, subtitleSize]);
-    // Обкладинка й субтитри — частина проєкту: їдуть в автозбереження разом зі слайдами
+    // Базова затримка між слайдами (с) — спільна для презентації, типово 3с
+    const [slideHold, setSlideHold] = useState(() => {
+        try {
+            const v = localStorage.getItem('slide_hold_sec');
+            return v != null && v !== '' && isFinite(Number(v)) ? Math.max(0, Math.min(Number(v), 10)) : DEFAULT_SLIDE_HOLD_SEC;
+        } catch (e) { return DEFAULT_SLIDE_HOLD_SEC; }
+    });
+    useEffect(() => {
+        SLIDE_HOLD_SETTINGS.seconds = slideHold;
+        try { localStorage.setItem('slide_hold_sec', String(slideHold)); } catch (e) { /* приватний режим */ }
+    }, [slideHold]);
+    // Обкладинка, субтитри й затримка — частина проєкту: їдуть в автозбереження разом зі слайдами
     const autosaveExtra = useMemo(() => ({
         cover: coverImage,
-        subtitles: { enabled: subtitlesOn, size: subtitleSize }
-    }), [coverImage, subtitlesOn, subtitleSize]);
+        subtitles: { enabled: subtitlesOn, size: subtitleSize },
+        slideHold
+    }), [coverImage, subtitlesOn, subtitleSize, slideHold]);
     const autosave = useAutosave(slides, true, autosaveExtra);      // IndexedDB, дебаунс 2.5с (U-01/U-04)
     const autosaveDirtyRef = autosave.dirtyRef;
     const shouldWarnBeforeUnload = useCallback(
@@ -4754,6 +4776,7 @@ export default function VideoEditor() {
             setSubtitlesOn(!!restoreSnapshot.subtitles.enabled);
             setSubtitleSize(restoreSnapshot.subtitles.size || 'medium');
         }
+        if (typeof restoreSnapshot.slideHold === 'number') setSlideHold(Math.max(0, Math.min(restoreSnapshot.slideHold, 10)));
         setSelectedObjectId(null);
         setRestoreSnapshot(null);
         toast('success', `Сесію відновлено: ${restoreSnapshot.slides.length} слайд(ів)`);
@@ -4951,7 +4974,8 @@ export default function VideoEditor() {
                 studioProVideo: 2, exportedAt: Date.now(),
                 slides: await serializeSlidesForEmbed(slides),
                 cover: coverImage,
-                subtitles: { enabled: subtitlesOn, size: subtitleSize }
+                subtitles: { enabled: subtitlesOn, size: subtitleSize },
+                slideHold
             };
             const blob = new Blob([JSON.stringify(data)], { type: 'application/json' });
             const url = URL.createObjectURL(blob);
@@ -4977,6 +5001,7 @@ export default function VideoEditor() {
                 setSubtitlesOn(!!data.subtitles.enabled);
                 setSubtitleSize(data.subtitles.size || 'medium');
             }
+            if (typeof data.slideHold === 'number') setSlideHold(Math.max(0, Math.min(data.slideHold, 10)));
             if (deadMedia > 0) toast('error', `Не відновлено медіа: ${deadMedia} (файл зі старої версії)`);
             toast('success', `Проєкт відкрито: ${revived.length} слайд(ів)`);
             logChange('Проєкт', `Відкрито файл .atmo: "${file.name}"`, { slides: revived.length });
@@ -7096,7 +7121,7 @@ export default function VideoEditor() {
             // Вшиваємо проєкт (як у звичайному експорті) і віддаємо файл
             let finalBlob = videoBlob;
             try {
-                const snapshot = { studioProVideo: 2, exportedAt: Date.now(), slides: await serializeSlidesForEmbed(slides), cover: coverImage, subtitles: { enabled: subtitlesOn, size: subtitleSize } };
+                const snapshot = { studioProVideo: 2, exportedAt: Date.now(), slides: await serializeSlidesForEmbed(slides), cover: coverImage, subtitles: { enabled: subtitlesOn, size: subtitleSize }, slideHold };
                 const b64 = btoa(unescape(encodeURIComponent(JSON.stringify(snapshot))));
                 finalBlob = new Blob([videoBlob, `\n${VIDEO_PROJECT_START}\n${b64}\n${VIDEO_PROJECT_END}\n`], { type: 'video/mp4' });
             } catch (e) { /* завеликий проєкт — чисте відео */ }
@@ -7323,7 +7348,7 @@ export default function VideoEditor() {
             // переживають перезавантаження сторінки.
             let finalBlob = videoBlob;
             try {
-                const snapshot = { studioProVideo: 2, exportedAt: Date.now(), slides: await serializeSlidesForEmbed(slides), cover: coverImage, subtitles: { enabled: subtitlesOn, size: subtitleSize } };
+                const snapshot = { studioProVideo: 2, exportedAt: Date.now(), slides: await serializeSlidesForEmbed(slides), cover: coverImage, subtitles: { enabled: subtitlesOn, size: subtitleSize }, slideHold };
                 const b64 = btoa(unescape(encodeURIComponent(JSON.stringify(snapshot))));
                 finalBlob = new Blob([videoBlob, `\n${VIDEO_PROJECT_START}\n${b64}\n${VIDEO_PROJECT_END}\n`], { type: mimeType });
             } catch (e) {
@@ -7464,6 +7489,7 @@ export default function VideoEditor() {
                 setSubtitlesOn(!!snapshot.subtitles.enabled);
                 setSubtitleSize(snapshot.subtitles.size || 'medium');
             }
+            if (typeof snapshot.slideHold === 'number') setSlideHold(Math.max(0, Math.min(snapshot.slideHold, 10)));
             if (deadMedia > 0) {
                 toast('error', `Не вдалося відновити ${deadMedia} відео/аудіо: файл експортовано старішою версією редактора. Переекспортуйте проєкт із поточної версії.`, { duration: 9000 });
             }
@@ -8392,6 +8418,29 @@ export default function VideoEditor() {
                         )}
                     </label>
                 )}
+                {/* Базова затримка між слайдами — спільна для всієї презентації */}
+                <label className="flex items-center gap-2 text-[11px] font-semibold text-slate-500">
+                    Пауза між слайдами
+                    <input
+                        type="number" step="0.5" min="0" max="10"
+                        value={slideHold}
+                        onChange={(e) => {
+                            const v = Math.max(0, Math.min(parseFloat(e.target.value) || 0, 10));
+                            setSlideHold(v);
+                            logChange('Слайд', `Пауза між слайдами → ${v}с (вся презентація)`);
+                        }}
+                        className="w-16 px-1.5 py-1 text-xs border border-slate-200 rounded-lg outline-none focus:border-[#16a34a] bg-white"
+                        title="Витримка наприкінці КОЖНОГО слайда після озвучки й анімацій, перш ніж почнеться наступний (0–10с). Спільна для всієї презентації"
+                    />
+                    <span className="text-slate-300 text-[10px]">сек</span>
+                    {slideHold !== DEFAULT_SLIDE_HOLD_SEC && (
+                        <button
+                            onClick={() => setSlideHold(DEFAULT_SLIDE_HOLD_SEC)}
+                            className="text-[10px] font-bold text-slate-400 hover:text-[#16a34a] underline"
+                            title={`Повернути базову затримку ${DEFAULT_SLIDE_HOLD_SEC}с`}
+                        >типова</button>
+                    )}
+                </label>
 
                 {/* Швидкі пресети анімацій (без AI) */}
                 <div className="space-y-1.5">
