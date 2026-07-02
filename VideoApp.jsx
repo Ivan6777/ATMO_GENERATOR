@@ -4103,6 +4103,18 @@ function videoReducer(state, action) {
             };
         }
 
+        // U-108: вимкнути всі анімації слайда одним кліком (появу і зникнення)
+        case 'CLEAR_SLIDE_ANIMATIONS': {
+            return mapSlide(action.slideId, s => ({
+                ...s,
+                objects: s.objects.map(o => ({
+                    ...o,
+                    animation: { type: 'none', delay: 0, duration: 0.5 },
+                    exitAnimation: null
+                }))
+            }));
+        }
+
         case 'SYNC_ANIMATIONS_TO_AUDIO': {
             return mapSlide(action.slideId, s => {
                 const dur = s.audioDuration || 0;
@@ -6793,6 +6805,21 @@ export default function VideoEditor() {
                                                 {fontList.map(f => <option key={f} value={f}>{f}</option>)}
                                             </select>
                                         </label>
+                                        {/* U-101: міжрядковий інтервал — лікує «великі пробіли між написами» */}
+                                        <label className="flex items-center gap-2 text-[11px] font-semibold text-slate-500">
+                                            Інтервал
+                                            <input
+                                                type="number" step="0.05" min="0.7" max="3"
+                                                value={obj.lines?.[0]?.lineSpacing || 1}
+                                                onChange={(e) => {
+                                                    const v = Math.min(3, Math.max(0.7, parseFloat(e.target.value) || 1));
+                                                    updateObj({ lines: (obj.lines || []).map(l => ({ ...l, lineSpacing: v })) });
+                                                }}
+                                                title="Міжрядковий інтервал (1 = звичайний)"
+                                                className="w-16 px-1.5 py-1 text-xs border border-slate-200 rounded-lg outline-none focus:border-indigo-400 bg-white"
+                                            />
+                                            <span className="text-slate-300 text-[10px]">× висоти рядка</span>
+                                        </label>
                                     </>
                                 );
                             })()}
@@ -7040,6 +7067,21 @@ export default function VideoEditor() {
                             По диктору
                         </button>
                     </div>
+                    {/* U-108: вимкнути всі анімації слайда (дефолтні плашки теж) одним кліком */}
+                    <button
+                        onClick={() => {
+                            dispatchVideo({ type: 'CLEAR_SLIDE_ANIMATIONS', slideId: slide.id });
+                            toast('info', `Слайд ${slide.slideNumber}: анімації вимкнено`, {
+                                action: { label: 'Повернути', onClick: () => dispatchVideo({ type: 'UNDO' }) }
+                            });
+                            logChange('Анімація', `Слайд ${slide.slideNumber}: усі анімації вимкнено`);
+                        }}
+                        disabled={slide.objects.length === 0}
+                        className="w-full px-2 py-1.5 bg-slate-50 text-slate-500 hover:bg-slate-100 disabled:opacity-40 rounded-xl text-[11px] font-bold transition-colors"
+                        title="Прибрати анімації появи та зникнення з УСІХ об'єктів слайда — все видно одразу"
+                    >
+                        ∅ Без анімацій (весь слайд)
+                    </button>
                 </div>
 
                 {/* Перегенерація розподілу анімацій цього слайду через AI */}
@@ -7360,9 +7402,22 @@ export default function VideoEditor() {
                                                 <span className={`absolute top-1 left-1 text-[9px] font-bold px-1 rounded ${isActive ? 'bg-[#7c3aed] text-white' : 'bg-black/40 text-white'}`}>
                                                     {idx + 1}
                                                 </span>
+                                                {/* U-30: статуси слайда — озвучка / відео / помилка / тривалість */}
                                                 {sl.audioBase64 && (
-                                                    <CheckCircle size={10} className="absolute top-1 right-1 text-emerald-400 drop-shadow" />
+                                                    <CheckCircle size={10} className="absolute top-1 right-1 text-emerald-400 drop-shadow" title="Озвучено" />
                                                 )}
+                                                {sl.isGenerating && (
+                                                    <Loader2 size={10} className="absolute top-1 right-1 text-violet-500 animate-spin drop-shadow" title="Озвучується…" />
+                                                )}
+                                                {sl.objects.some(o => o.type === 'video') && (
+                                                    <Video size={10} className="absolute top-1 right-4 text-sky-400 drop-shadow" title="Містить відео" />
+                                                )}
+                                                {sl.error && (
+                                                    <AlertCircle size={10} className="absolute bottom-1 left-1 text-red-500 drop-shadow" title={sl.error} />
+                                                )}
+                                                <span className="absolute bottom-0.5 right-1 text-[7px] font-bold text-white bg-black/40 px-0.5 rounded" title="Тривалість сцени">
+                                                    {formatDuration(getSlideDuration(sl))}
+                                                </span>
                                                 {sl.objects.map((o, oi) => (
                                                     <div key={o.id} className="absolute overflow-hidden" style={{
                                                         left: `${(o.x / CANVAS_W) * 100}%`,
@@ -7732,9 +7787,13 @@ export default function VideoEditor() {
                                                             onMouseDown={(e) => e.stopPropagation()}
                                                             onBlur={(e) => {
                                                                 const base = obj.lines?.[0] || { color: '#1e293b', fontSize: 24, bold: false, align: 'l' };
-                                                                const newLines = e.target.value.split('\n').map((t, i) => ({
-                                                                    ...(obj.lines?.[i] || base), text: t, runs: undefined, bullet: undefined
-                                                                }));
+                                                                // U-35: незмінені рядки лишаємо як є — стилі рунів і формули
+                                                                // (MathML) зберігаються; руни скидаються лише у правлених рядках
+                                                                const newLines = e.target.value.split('\n').map((t, i) => {
+                                                                    const prev = obj.lines?.[i];
+                                                                    if (prev && prev.text === t) return prev;
+                                                                    return { ...(prev || base), text: t, runs: undefined, bullet: undefined };
+                                                                });
                                                                 dispatchVideo({ type: 'UPDATE_OBJECT', slideId: vSlide.id, objectId: obj.id, updates: { lines: newLines } });
                                                                 setEditingObjectId(null);
                                                             }}
