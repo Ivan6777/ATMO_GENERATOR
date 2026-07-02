@@ -6123,11 +6123,13 @@ export default function VideoEditor() {
 
             // Спробуємо витягти розміри та позицію з HTML (якщо скопійовано з PowerPoint чи іншого редактора)
             let pptxRect = null;
+            let pastedHtmlDoc = null; // розібраний HTML буфера — для вставки ТЕКСТУ зі стилями
             try {
                 const htmlData = e.clipboardData.getData('text/html');
                 if (htmlData) {
                     const parser = new DOMParser();
                     const doc = parser.parseFromString(htmlData, 'text/html');
+                    pastedHtmlDoc = doc;
 
                     const tryParse = (val) => {
                         if (!val) return null;
@@ -6165,6 +6167,11 @@ export default function VideoEditor() {
                 }
             } catch (err) { }
 
+            // Текстовий блок PowerPoint = text/html З ТЕКСТОМ + PNG-рендер у items.
+            // Якщо в HTML є справжній текст — вставляємо ТЕКСТ, а не його картинку.
+            const htmlText = pastedHtmlDoc ? (pastedHtmlDoc.body.textContent || '').trim() : '';
+            const hasHtmlText = htmlText.length > 0;
+
             const items = (e.clipboardData && e.clipboardData.items) || [];
             for (const it of items) {
                 if (it.type && it.type.indexOf('video') === 0) {
@@ -6194,6 +6201,7 @@ export default function VideoEditor() {
                     }
                 }
                 if (it.type && it.type.indexOf('image') === 0) {
+                    if (hasHtmlText) continue; // це PNG-рендер текстового блока — вставимо текст нижче
                     const file = it.getAsFile();
                     if (file) {
                         e.preventDefault();
@@ -6230,6 +6238,87 @@ export default function VideoEditor() {
                     }
                 }
             }
+
+            // ── Вставка ТЕКСТУ з PowerPoint: аналогічний розмір, кегль, колір, стилі ──
+            const plainText = e.clipboardData.getData('text/plain');
+            if (!hasHtmlText && !plainText.trim()) return;
+            e.preventDefault();
+            // pt -> px канваса: слайд 13.33in x 7.5in = 1280x720 => рівно 96dpi
+            const cssToPx = (v) => {
+                if (!v) return null;
+                const m = String(v).match(/([\d.]+)\s*(pt|px|in|em)?/);
+                if (!m) return null;
+                const n = parseFloat(m[1]);
+                if (!isFinite(n) || n <= 0) return null;
+                const u = m[2] || 'px';
+                return u === 'pt' ? n * 96 / 72 : (u === 'in' ? n * 96 : (u === 'em' ? n * 16 : n));
+            };
+            let lines = [];
+            if (hasHtmlText) {
+                // Абзаци — «листові» блоки; стилі збираються вглиб по спанах
+                const blocks = Array.from(pastedHtmlDoc.body.querySelectorAll('p, li, div, h1, h2, h3'))
+                    .filter(el => el.textContent.trim() && !el.querySelector('p, li, div, h1, h2, h3'));
+                const roots = blocks.length ? blocks : [pastedHtmlDoc.body];
+                for (const para of roots) {
+                    const runs = [];
+                    const walk = (node, inh) => {
+                        if (node.nodeType === 3) {
+                            const t = node.textContent.replace(/\s+/g, ' ');
+                            if (t) runs.push({ ...inh, text: t });
+                            return;
+                        }
+                        if (node.nodeType !== 1) return;
+                        const st = node.style || {};
+                        const fw = st.fontWeight || '';
+                        const next = {
+                            ...inh,
+                            fontSize: Math.round(cssToPx(st.fontSize) || inh.fontSize),
+                            color: (st.color && st.color !== 'inherit' ? st.color : null) || inh.color,
+                            bold: fw === 'bold' || parseInt(fw, 10) >= 600 || ['B', 'STRONG'].includes(node.tagName) || inh.bold,
+                            italic: st.fontStyle === 'italic' || ['I', 'EM'].includes(node.tagName) || inh.italic,
+                            underline: (st.textDecoration || '').includes('underline') || node.tagName === 'U' || inh.underline,
+                            font: ((st.fontFamily || '').split(',')[0] || '').replace(/["']/g, '').trim() || inh.font
+                        };
+                        node.childNodes.forEach(ch => walk(ch, next));
+                    };
+                    walk(para, { fontSize: 24, color: '#1e293b', bold: false, italic: false, underline: false, font: null });
+                    const clean = runs.filter(r => r.text.trim());
+                    if (!clean.length) continue;
+                    const ta = (para.style && para.style.textAlign) || '';
+                    lines.push({
+                        text: clean.map(r => r.text).join('').trim(),
+                        runs: clean,
+                        color: clean[0].color,
+                        fontSize: Math.max(...clean.map(r => r.fontSize)),
+                        bold: clean[0].bold, italic: clean[0].italic,
+                        align: ta === 'center' ? 'ctr' : (ta === 'right' ? 'r' : 'l'),
+                        indent: 0, lineSpacing: 1
+                    });
+                }
+            }
+            if (!lines.length) { // фолбек: простий текст рядками
+                lines = plainText.split('\n').filter(t => t.trim()).map(t => ({
+                    text: t.trim(), runs: undefined, color: '#1e293b', fontSize: 24,
+                    bold: false, italic: false, align: 'l', indent: 0, lineSpacing: 1
+                }));
+            }
+            if (!lines.length) return;
+            // Розмір і позиція: з HTML PowerPoint (pt -> px 1:1 до канваса), інакше — за вмістом
+            const estH = lines.reduce((a, l) => a + (l.fontSize || 24) * 1.35, 0) + 16;
+            const tw = (pptxRect && pptxRect.w && isFinite(pptxRect.w)) ? Math.min(pptxRect.w, CANVAS_W) : Math.min(760, CANVAS_W - 160);
+            const th = (pptxRect && pptxRect.h && isFinite(pptxRect.h)) ? Math.min(pptxRect.h, CANVAS_H) : Math.min(Math.max(estH, 60), CANVAS_H - 80);
+            const txp = (pptxRect && pptxRect.x != null && isFinite(pptxRect.x)) ? pptxRect.x : Math.round((CANVAS_W - tw) / 2);
+            const typ = (pptxRect && pptxRect.y != null && isFinite(pptxRect.y)) ? pptxRect.y : Math.round((CANVAS_H - th) / 2);
+            const textObject = {
+                id: crypto.randomUUID(), type: 'text',
+                x: Math.round(txp), y: Math.round(typ), w: Math.round(tw), h: Math.round(th),
+                fillColor: null, lineColor: null, vAlign: 't', lines,
+                animation: { type: 'fadeIn', delay: 0, duration: 0.8 }
+            };
+            dispatchVideo({ type: 'ADD_OBJECT', slideId: selectedSlide.id, object: textObject });
+            setSelectedObjectId(textObject.id);
+            toast('success', `Вставлено текст (${lines.length} рядк.) зі стилями PowerPoint`);
+            logChange('Вставка', 'Вставлено текст з буфера (PowerPoint) зі стилями та розміром');
         };
         window.addEventListener('paste', onPaste);
         return () => window.removeEventListener('paste', onPaste);
