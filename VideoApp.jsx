@@ -4372,6 +4372,8 @@ export default function VideoEditor() {
     const [marqueeRect, setMarqueeRect] = useState(null);            // U-38
     const [ctxMenu, setCtxMenu] = useState(null);                    // U-42 {x,y,objId}
     const [exportEta, setExportEta] = useState('');                  // U-23
+    const [scenesCollapsed, setScenesCollapsed] = useState(false);   // U-33
+    const [helpOpen, setHelpOpen] = useState(false);                 // U-111
     const voiceSampleCacheRef = useRef(new Map());                   // U-63 voice -> {base64, sampleRate}
     const [voiceSampleLoading, setVoiceSampleLoading] = useState(false);
 
@@ -7550,6 +7552,38 @@ export default function VideoEditor() {
                 dict={pronDict}
                 onChange={updatePronDict}
             />
+            {/* U-111: довідка «Вимоги та поради» */}
+            {helpOpen && (
+                <div className="fixed inset-0 z-[90] flex items-center justify-center" role="dialog" aria-modal="true" aria-label="Довідка">
+                    <div className="absolute inset-0 bg-black/40" onClick={() => setHelpOpen(false)} />
+                    <div className="relative bg-white rounded-2xl shadow-2xl w-[560px] max-w-[94vw] max-h-[84vh] overflow-y-auto p-6 text-xs text-slate-600 leading-relaxed space-y-3">
+                        <div className="flex items-center justify-between">
+                            <h2 className="text-sm font-bold text-slate-800">Вимоги та поради</h2>
+                            <button onClick={() => setHelpOpen(false)} aria-label="Закрити" className="text-slate-400 hover:text-slate-600 p-1">✕</button>
+                        </div>
+                        <div>
+                            <h3 className="font-bold text-slate-700 mb-1">📄 Формати файлів</h3>
+                            <p><strong>Презентації:</strong> .pptx (старий .ppt збережіть у PowerPoint як .pptx). <strong>Зображення:</strong> PNG, JPEG, GIF, BMP, WebP, SVG, ICO, TIFF, AVIF, HEIC — визначаються автоматично; векторні EMF/WMF браузер не декодує (буде плейсхолдер). <strong>Відео:</strong> MP4 (H.264) — найкраще; MOV/WebM теж працюють. <strong>Проєкт:</strong> .atmo або експортований MP4 — обидва відкриваються назад у редакторі.</p>
+                        </div>
+                        <div>
+                            <h3 className="font-bold text-slate-700 mb-1">🎨 Редактор</h3>
+                            <p>Подвійний клік по тексту — редагування на місці. Перетягніть по порожньому місцю — рамкове виділення; Shift+клік — додати до виділення; у панелі з'являться «Вирівняти» та «Розподілити». ПКМ по об'єкту — меню (шари, закріплення, дублювання). Слайди зліва переставляються перетягуванням. Всі гарячі клавіші — кнопка «?».</p>
+                        </div>
+                        <div>
+                            <h3 className="font-bold text-slate-700 mb-1">🎙️ Озвучка</h3>
+                            <p>Українські речення читаються українським голосом, англійські — британською англійською (автоматично). Складні терміни й наголоси задайте у «Вимова» — на слайдах текст не зміниться. «▶ Зразок» — прослухати голос до генерації. Якщо звук зник — кнопка з навушниками в топбарі перезапустить аудіо без перезавантаження.</p>
+                        </div>
+                        <div>
+                            <h3 className="font-bold text-slate-700 mb-1">🎬 Анімації та відео</h3>
+                            <p>Кожен об'єкт має появу та зникнення (exit) — керуйте в панелі об'єкта. «Без анімацій (весь слайд)» — вимикає все одним кліком. Коротке відео на довгому слайді типово зациклюється; режим (loop/розтягнути/обрізати) — в панелі відео. Великі презентації (150МБ+) імпортуються довше — не закривайте вкладку, прогрес видно на екрані.</p>
+                        </div>
+                        <div>
+                            <h3 className="font-bold text-slate-700 mb-1">💾 Збереження</h3>
+                            <p>Проєкт автозберігається у браузері кожні ~3 секунди (статус у топбарі) і пропонується до відновлення при наступному вході. Ctrl+S — зберегти у файл .atmo. Експортований MP4 містить проєкт усередині — його можна відкрити й доредагувати.</p>
+                        </div>
+                    </div>
+                </div>
+            )}
             {/* U-79/U-85: видимий фокус для клавіатури + повага до reduced-motion */}
             <style>{`
                 :focus-visible { outline: 2px solid #7c3aed; outline-offset: 2px; }
@@ -7676,8 +7710,17 @@ export default function VideoEditor() {
                 >
                 <div className="flex-1 flex overflow-hidden">
 
-                    {/* ── ЛІВА ПАНЕЛЬ: сцени ── */}
-                    <div className="w-[154px] flex-shrink-0 bg-white border-r border-slate-200 flex flex-col">
+                    {/* ── ЛІВА ПАНЕЛЬ: сцени (U-33: згортається для більшого канваса) ── */}
+                    <div className={`${scenesCollapsed ? 'w-7' : 'w-[154px]'} flex-shrink-0 bg-white border-r border-slate-200 flex flex-col transition-all`}>
+                        <button
+                            onClick={() => setScenesCollapsed(c => !c)}
+                            aria-label={scenesCollapsed ? 'Розгорнути панель сцен' : 'Згорнути панель сцен'}
+                            title={scenesCollapsed ? 'Розгорнути сцени' : 'Згорнути сцени'}
+                            className="h-6 flex items-center justify-center text-slate-400 hover:text-[#7c3aed] hover:bg-slate-50"
+                        >
+                            {scenesCollapsed ? '»' : '«'}
+                        </button>
+                        {!scenesCollapsed && <>
                         <button
                             onClick={() => {
                                 const fileIn = document.createElement('input');
@@ -7783,9 +7826,9 @@ export default function VideoEditor() {
                                                         opacity: o.opacity != null ? o.opacity : 1,
                                                         zIndex: oi + 1
                                                     }}>
-                                                        {o.type === 'image' && <img src={o.src} alt="" className="w-full h-full object-fill" draggable={false} />}
+                                                        {o.type === 'image' && <img src={o.src} alt="" loading="lazy" decoding="async" className="w-full h-full object-fill" draggable={false} />}
                                                         {o.type === 'video' && (o.poster
-                                                            ? <img src={o.poster} alt="" className="w-full h-full object-fill" draggable={false} />
+                                                            ? <img src={o.poster} alt="" loading="lazy" decoding="async" className="w-full h-full object-fill" draggable={false} />
                                                             : <div className="w-full h-full bg-slate-800" />)}
                                                         {o.type === 'math' && (
                                                             <div className="w-full h-full overflow-hidden" style={{ fontSize: 3, color: '#111' }} dangerouslySetInnerHTML={{ __html: o.mathml || '' }} />
@@ -7830,6 +7873,7 @@ export default function VideoEditor() {
                                 );
                             })}
                         </div>
+                        </>}
                     </div>
 
                     {/* ── ЦЕНТРАЛЬНА ОБЛАСТЬ ── */}
@@ -7861,6 +7905,15 @@ export default function VideoEditor() {
                                     className="p-1.5 rounded text-slate-400 hover:text-[#7c3aed] hover:bg-slate-100 transition-colors"
                                 >
                                     <Headphones size={14} />
+                                </button>
+                                {/* U-111: довідка «Вимоги та поради» */}
+                                <button
+                                    onClick={() => setHelpOpen(true)}
+                                    aria-label="Довідка: вимоги та поради"
+                                    title="Вимоги до форматів і поради по роботі"
+                                    className="p-1.5 rounded text-slate-400 hover:text-[#7c3aed] hover:bg-slate-100 transition-colors"
+                                >
+                                    <FileText size={14} />
                                 </button>
                                 {/* U-72: довідка гарячих клавіш */}
                                 <button
