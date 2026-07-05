@@ -5467,17 +5467,30 @@ export default function VideoEditor() {
                 });
             }
         } else {
-            // U-51: Shift під час resize — збереження пропорцій
-            let nw = Math.max(20, Math.round(d.origW + dx));
-            let nh = Math.max(20, Math.round(d.origH + dy));
-            if (e.shiftKey && d.origW > 0 && d.origH > 0) {
-                const k = Math.max(nw / d.origW, nh / d.origH);
-                nw = Math.max(20, Math.round(d.origW * k));
-                nh = Math.max(20, Math.round(d.origH * k));
+            // Розтягування за 8 ручок: кути змінюють обидва виміри, сторони — один
+            // (протилежний край стоїть на місці). Пропорції (U-51): для фото/відео
+            // кути тримають пропорцію ТИПОВО (Shift — вільно), для решти — Shift вмикає.
+            const dir = d.mode === 'resize' ? 'se' : String(d.mode).slice(7); // 'resize-nw' -> 'nw'
+            const MIN = 20;
+            let nx = d.origX, ny = d.origY, nw = d.origW, nh = d.origH;
+            if (dir.includes('e')) nw = d.origW + dx;
+            if (dir.includes('w')) nw = d.origW - dx;
+            if (dir.includes('s')) nh = d.origH + dy;
+            if (dir.includes('n')) nh = d.origH - dy;
+            const isCorner = dir.length === 2;
+            const keepRatio = isCorner && d.origW > 0 && d.origH > 0 && (d.mediaRatio ? !e.shiftKey : e.shiftKey);
+            if (keepRatio) {
+                const k = Math.max(Math.max(nw, MIN) / d.origW, Math.max(nh, MIN) / d.origH);
+                nw = d.origW * k;
+                nh = d.origH * k;
             }
+            nw = Math.max(MIN, Math.round(nw));
+            nh = Math.max(MIN, Math.round(nh));
+            if (dir.includes('w')) nx = Math.round(d.origX + (d.origW - nw));
+            if (dir.includes('n')) ny = Math.round(d.origY + (d.origH - nh));
             dispatchVideo({
                 type: 'UPDATE_OBJECT', slideId: d.slideId, objectId: d.objectId,
-                updates: { w: nw, h: nh }
+                updates: { x: nx, y: ny, w: nw, h: nh }
             });
         }
     }, [slides]);
@@ -5523,7 +5536,8 @@ export default function VideoEditor() {
             slideId, objectId: obj.id, mode, wasSelected,
             startX: e.clientX, startY: e.clientY,
             origX: obj.x, origY: obj.y, origW: obj.w, origH: obj.h,
-            groupIds, groupOrig
+            groupIds, groupOrig,
+            mediaRatio: obj.type === 'image' || obj.type === 'video' // фото/відео: кути тримають пропорції
         };
         window.addEventListener('mousemove', handleObjectDragMove);
         window.addEventListener('mouseup', handleObjectDragEnd);
@@ -5583,6 +5597,53 @@ export default function VideoEditor() {
     useEffect(() => {
         if (cropModeId && cropModeId !== selectedObjectId) setCropModeId(null);
     }, [selectedObjectId, cropModeId]);
+
+    // --- Розрізання аудіо/відео кліпа на два в позиції бігунка таймлайна ---
+    // Перша половина закінчується в точці розрізу, друга починається з неї і
+    // стартує на таймлайні саме в цей момент (delay += точка розрізу). Обидві
+    // половини далі живуть окремо: можна зсувати, тримити чи видаляти.
+    const splitMediaObjectAt = async (slideId, objId, atTime) => {
+        const slide = slides.find(s => s.id === slideId);
+        const obj = slide?.objects.find(o => o.id === objId);
+        if (!obj || (obj.type !== 'audio' && obj.type !== 'video') || !obj.src) return;
+        let full = 0;
+        try {
+            const el = await loadVideo(obj.src);
+            full = el && isFinite(el.duration) ? el.duration : 0;
+        } catch (e) { /* нижче перевірка */ }
+        const ts = obj.trimStart || 0;
+        const te = (obj.trimEnd != null && obj.trimEnd > ts) ? obj.trimEnd : full;
+        if (!(te > ts)) { toast('error', 'Не вдалося визначити тривалість кліпа'); return; }
+        const delay = (obj.animation && obj.animation.delay) || 0;
+        const local = (atTime != null ? atTime : 0) - delay; // момент усередині кліпа
+        if (local < 0.2 || local > (te - ts) - 0.2) {
+            toast('info', 'Поставте бігунок таймлайна всередині кліпа (не ближче 0.2с до країв) і натисніть «Розрізати»');
+            return;
+        }
+        const cut = Math.round((ts + local) * 100) / 100;
+        const newId = 'obj_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
+        // Перша половина: грає до точки розрізу і зупиняється
+        dispatchVideo({ type: 'UPDATE_OBJECT', slideId, objectId: obj.id, updates: { trimEnd: cut, videoFitMode: 'trim' } });
+        // Друга половина: та сама доріжка від точки розрізу, старт у момент розрізу
+        const second = {
+            ...obj,
+            id: newId,
+            trimStart: cut,
+            trimEnd: (obj.trimEnd != null && obj.trimEnd > ts) ? obj.trimEnd : (full ? Math.round(te * 100) / 100 : null),
+            videoFitMode: 'trim',
+            animation: { ...(obj.animation || { type: 'none', duration: 0.5 }), delay: Math.round((delay + local) * 100) / 100 }
+        };
+        if (obj.type === 'audio') { // зсуваємо іконку, щоб два кліпи не злипались на канвасі
+            second.x = (obj.x || 0) + 30;
+            second.y = (obj.y || 0) + 30;
+        }
+        dispatchVideo({ type: 'ADD_OBJECT', slideId, object: second });
+        setSelectedObjectId(newId);
+        toast('success', `Кліп розрізано на ${atTime.toFixed(1)}с — тепер це два незалежні кліпи`, {
+            action: { label: 'Повернути', onClick: () => { dispatchVideo({ type: 'UNDO' }); dispatchVideo({ type: 'UNDO' }); } }
+        });
+        logChange('Медіа', `${obj.type === 'audio' ? 'Аудіо' : 'Відео'} розрізано на ${atTime.toFixed(1)}с`, { slideId, objId });
+    };
 
     // --- Перетягування блоків анімацій на таймлайні (зміна delay) ---
 
@@ -8112,11 +8173,24 @@ export default function VideoEditor() {
                                             {ANIMATIONS[obj.animation.type]?.label} · {obj.animation.delay}с
                                         </div>
                                     )}
-                                    {/* Ручка resize */}
-                                    <div
-                                        onMouseDown={(e) => startObjectDrag(e, slide.id, obj, 'resize')}
-                                        className="absolute -bottom-1.5 -right-1.5 w-3.5 h-3.5 bg-indigo-600 border-2 border-white rounded-full cursor-se-resize shadow"
-                                    />
+                                    {/* 8 ручок розтягування (фото/відео за кути — пропорційно, Shift — вільно) */}
+                                    {[
+                                        ['nw', { top: -5, left: -5, cursor: 'nwse-resize' }],
+                                        ['n', { top: -5, left: '50%', marginLeft: -5, cursor: 'ns-resize' }],
+                                        ['ne', { top: -5, right: -5, cursor: 'nesw-resize' }],
+                                        ['e', { top: '50%', right: -5, marginTop: -5, cursor: 'ew-resize' }],
+                                        ['se', { bottom: -5, right: -5, cursor: 'nwse-resize' }],
+                                        ['s', { bottom: -5, left: '50%', marginLeft: -5, cursor: 'ns-resize' }],
+                                        ['sw', { bottom: -5, left: -5, cursor: 'nesw-resize' }],
+                                        ['w', { top: '50%', left: -5, marginTop: -5, cursor: 'ew-resize' }]
+                                    ].map(([dir, st]) => (
+                                        <div
+                                            key={dir}
+                                            onMouseDown={(e) => { e.stopPropagation(); startObjectDrag(e, slide.id, obj, 'resize-' + dir); }}
+                                            className="absolute w-2.5 h-2.5 bg-indigo-600 border-2 border-white rounded-full shadow"
+                                            style={st}
+                                        />
+                                    ))}
                                 </>
                             )}
                         </div>
@@ -9866,16 +9940,34 @@ export default function VideoEditor() {
                                                                     </>
                                                                 )}
                                                             </div>
-                                                            <div
-                                                                onMouseDown={(e) => { e.stopPropagation(); startObjectDrag(e, vSlide.id, obj, 'resize'); }}
-                                                                className="absolute -bottom-1.5 -right-1.5 w-3 h-3 bg-[#7c3aed] border-2 border-white rounded-full cursor-se-resize shadow"
-                                                            />
+                                                            {/* 8 ручок розтягування: кути + сторони. Фото/відео за кути
+                                                                тягнуться ПРОПОРЦІЙНО (Shift — вільно), сторони тягнуть один вимір */}
+                                                            {cropModeId !== obj.id && [
+                                                                ['nw', { top: -5, left: -5, cursor: 'nwse-resize' }],
+                                                                ['n', { top: -5, left: '50%', marginLeft: -5, cursor: 'ns-resize' }],
+                                                                ['ne', { top: -5, right: -5, cursor: 'nesw-resize' }],
+                                                                ['e', { top: '50%', right: -5, marginTop: -5, cursor: 'ew-resize' }],
+                                                                ['se', { bottom: -5, right: -5, cursor: 'nwse-resize' }],
+                                                                ['s', { bottom: -5, left: '50%', marginLeft: -5, cursor: 'ns-resize' }],
+                                                                ['sw', { bottom: -5, left: -5, cursor: 'nesw-resize' }],
+                                                                ['w', { top: '50%', left: -5, marginTop: -5, cursor: 'ew-resize' }]
+                                                            ].map(([dir, st]) => (
+                                                                <div
+                                                                    key={dir}
+                                                                    onMouseDown={(e) => { e.stopPropagation(); startObjectDrag(e, vSlide.id, obj, 'resize-' + dir); }}
+                                                                    className="absolute w-2.5 h-2.5 bg-[#7c3aed] border-2 border-white rounded-full shadow z-[999]"
+                                                                    style={st}
+                                                                    title={dir.length === 2
+                                                                        ? ((obj.type === 'image' || obj.type === 'video') ? 'Тягніть — пропорційно; Shift — вільно' : 'Тягніть — вільно; Shift — пропорційно')
+                                                                        : 'Розтягнути цей бік'}
+                                                                />
+                                                            ))}
                                                             {/* Обрізка прямо на слайді: ✂ вмикає ручки по краях */}
                                                             {obj.type === 'image' && cropModeId !== obj.id && (
                                                                 <button
                                                                     onMouseDown={(e) => e.stopPropagation()}
                                                                     onClick={(e) => { e.stopPropagation(); setCropModeId(obj.id); }}
-                                                                    className="absolute -bottom-2 -left-2 w-5 h-5 bg-emerald-500 hover:bg-emerald-600 text-white rounded-full text-[10px] leading-none flex items-center justify-center shadow z-[1000]"
+                                                                    className="absolute top-full mt-1.5 right-0 w-5 h-5 bg-emerald-500 hover:bg-emerald-600 text-white rounded-full text-[10px] leading-none flex items-center justify-center shadow z-[1000]"
                                                                     title="Обрізати картинку прямо на слайді: з'являться ручки по краях"
                                                                 >✂</button>
                                                             )}
@@ -10514,6 +10606,36 @@ export default function VideoEditor() {
                                                         />
                                                     </label>
                                                 </div>
+                                                {/* Міжрядковий інтервал: слайдер (0.7–3×) + точне число, на весь блок */}
+                                                <label className="flex items-center gap-2 text-[10px] font-semibold text-slate-500">
+                                                    Інтервал
+                                                    <input
+                                                        type="range" min="0.7" max="3" step="0.05"
+                                                        value={selectedObject.lines?.[0]?.lineSpacing || 1}
+                                                        onChange={(e) => {
+                                                            const v = Math.min(3, Math.max(0.7, parseFloat(e.target.value) || 1));
+                                                            dispatchVideo({
+                                                                type: 'UPDATE_OBJECT', slideId: vSlide.id, objectId: selectedObject.id,
+                                                                updates: { lines: (selectedObject.lines || []).map(l => ({ ...l, lineSpacing: v })) }
+                                                            });
+                                                        }}
+                                                        className="flex-grow accent-[#7c3aed] cursor-pointer"
+                                                        title="Міжрядковий інтервал (1 = звичайний, менше — щільніше, більше — розрідженіше)"
+                                                    />
+                                                    <input
+                                                        type="number" min="0.7" max="3" step="0.05"
+                                                        value={selectedObject.lines?.[0]?.lineSpacing || 1}
+                                                        onChange={(e) => {
+                                                            const v = Math.min(3, Math.max(0.7, parseFloat(e.target.value) || 1));
+                                                            dispatchVideo({
+                                                                type: 'UPDATE_OBJECT', slideId: vSlide.id, objectId: selectedObject.id,
+                                                                updates: { lines: (selectedObject.lines || []).map(l => ({ ...l, lineSpacing: v })) }
+                                                            });
+                                                        }}
+                                                        className="w-14 px-1 py-0.5 text-[11px] border border-slate-200 rounded outline-none focus:border-[#7c3aed] bg-white"
+                                                    />
+                                                    <span className="text-slate-300 text-[9px]">×</span>
+                                                </label>
                                             </div>
                                         )}
 
@@ -10666,6 +10788,17 @@ export default function VideoEditor() {
                                                             </div>
                                                         </>
                                                     )}
+                                                    {/* Розрізання кліпа на два в позиції бігунка таймлайна */}
+                                                    <button
+                                                        onClick={() => splitMediaObjectAt(vSlide.id, selectedObject.id, scrubTime)}
+                                                        disabled={scrubTime == null}
+                                                        className="w-full px-2 py-1.5 bg-amber-50 text-amber-700 hover:bg-amber-100 disabled:opacity-40 rounded-lg text-[10px] font-bold transition-colors"
+                                                        title={scrubTime == null
+                                                            ? 'Спершу поставте бігунок на таймлайні у місце розрізу'
+                                                            : `Розрізати ${isAudio ? 'аудіо' : 'відео'} на дві частини у ${scrubTime.toFixed(1)}с — далі кожну можна зсувати/тримити/видаляти окремо`}
+                                                    >
+                                                        ✂ Розрізати на бігунку{scrubTime != null ? ` (${scrubTime.toFixed(1)}с)` : ''}
+                                                    </button>
                                                     <button onClick={() => upd({ trimStart: 0, trimEnd: null, crop: null })} className="text-[10px] font-bold text-slate-500 hover:text-slate-700">↺ Скинути тримінг/обрізку</button>
                                                 </div>
                                             );
