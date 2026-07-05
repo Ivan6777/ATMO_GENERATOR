@@ -101,6 +101,8 @@ const SHORTCUTS = [
     { keys: ['Ctrl', 'C'], label: 'Копіювати виділені об\'єкти' },
     { keys: ['Ctrl', 'V'], label: 'Вставити (також слайд/об\'єкт прямо з PowerPoint)' },
     { keys: ['Ctrl', 'D'], label: 'Дублювати виділений об\'єкт' },
+    { keys: ['Ctrl', 'G'], label: 'Об\'єднати виділені об\'єкти в групу' },
+    { keys: ['Ctrl', 'Shift', 'G'], label: 'Розгрупувати виділену групу' },
     { keys: ['Delete'], label: 'Видалити виділені об\'єкти' },
     { keys: ['Esc'], label: 'Зняти виділення' },
     { keys: ['←', '↑', '→', '↓'], label: 'Посунути об\'єкт на 1 px' },
@@ -2109,6 +2111,27 @@ const loadJSZip = () => new Promise((res, rej) => {
     document.head.appendChild(script);
 });
 
+// ── Єдиний шрифт презентації: увесь текст імпортованих слайдів автоматично
+// переводиться на Roboto — однаковий вигляд незалежно від шрифтів у PPTX.
+// Сам Roboto вантажиться з Google Fonts (з кирилицею) звичайним конвеєром.
+// Формульні руни (r.math) не чіпаємо: Roboto не покриває математичні символи.
+const UNIFIED_FONT = 'Roboto';
+const forceUnifiedFont = (slides) => {
+    const fixLines = (lines) => {
+        for (const l of (lines || [])) {
+            l.font = UNIFIED_FONT;
+            for (const r of (l.runs || [])) if (!r.math) r.font = UNIFIED_FONT;
+        }
+    };
+    for (const sl of (slides || [])) {
+        for (const o of (sl.objects || [])) {
+            fixLines(o.lines);
+            for (const row of (o.rows || [])) for (const c of (row.cells || [])) fixLines(c.lines);
+        }
+    }
+    return slides;
+};
+
 // ── Шрифти презентації, яких немає ні серед вбудованих у PPTX, ні в системі:
 // пробуємо підвантажити з Google Fonts (з кирилицею). Якщо і там немає —
 // повертаємо список для чесного повідомлення «показано заміну».
@@ -3256,10 +3279,13 @@ const extractPptxData = async (file, onProgress) => {
         })();
     }
 
+    // Уніфікація шрифтів: увесь текст презентації — Roboto (вантажиться нижче)
+    forceUnifiedFont(extractedSlides);
+
     // Точне відтворення шрифтів: усе, що не вбудовано в PPTX і не встановлено
     // в системі, пробуємо взяти з Google Fonts; про решту — чесний тост
     if (typeof document !== 'undefined' && document.fonts) {
-        const fontNames = new Set([themeFonts.major, themeFonts.minor].filter(Boolean));
+        const fontNames = new Set([UNIFIED_FONT]);
         for (const sl of extractedSlides) {
             for (const o of (sl.objects || [])) {
                 for (const l of (o.lines || [])) {
@@ -3445,6 +3471,66 @@ const playSlideVideos = (slide, mix) => {
     });
     return Promise.all(readiness);
 };
+// Запуск відео/аудіо слайда З ДОВІЛЬНОЇ ПОЗИЦІЇ (відтворення зі скраба на
+// таймлайні): кожен кліп перемотується у кадр, що відповідає моменту tStart
+// слайда (з урахуванням delay анімації та режиму loop/trim/stretch), і
+// запускається з тими ж обробниками меж, що й звичайний старт з нуля.
+const playSlideVideosFrom = (slide, tStart) => {
+    if (!tStart || tStart <= 0.05) return playSlideVideos(slide);
+    (slide?.objects || []).filter(o => (o.type === 'video' || o.type === 'audio') && o.src).forEach(o => {
+        const v = videoCache.get(o.src);
+        if (!v || !(v.duration > 0)) return;
+        const ts = o.trimStart || 0;
+        const te = (o.trimEnd != null && o.trimEnd > ts) ? o.trimEnd : v.duration;
+        const span = Math.max(te - ts, 0.1);
+        const fit = o.videoFitMode || 'loop';
+        const local = tStart - ((o.animation && o.animation.delay) || 0);
+
+        const startAtPos = (pos, rate) => {
+            try {
+                v.muted = false;
+                v.playbackRate = rate || 1.0;
+                try { v.currentTime = Math.max(0, Math.min(pos, v.duration - 0.03)); } catch (e) { /* ignore */ }
+                v.ontimeupdate = () => {
+                    const limit = Math.min(te, v.duration - 0.05);
+                    if (v.currentTime >= limit) {
+                        if (fit === 'loop' && o.type === 'video') {
+                            v.currentTime = ts;
+                            const p = v.play();
+                            if (p && p.catch) p.catch(() => { });
+                        } else {
+                            v.pause();
+                            v.ontimeupdate = null;
+                        }
+                    }
+                };
+                const p = v.play();
+                if (p && p.catch) p.catch(() => { // автозвук відхилено — граємо беззвучно
+                    v.muted = true;
+                    const p2 = v.play();
+                    if (p2 && p2.catch) p2.catch(() => { });
+                });
+            } catch (e) { /* ignore */ }
+        };
+
+        if (local < 0) {
+            // Кліп ще не мав стартувати — плануємо на його момент (як при звичайному старті)
+            const id = setTimeout(() => startAtPos(ts), (-local) * 1000);
+            videoStartTimers.set(v, id);
+        } else if (fit === 'stretch' && o.type === 'video') {
+            const naturalDur = v.duration - ts;
+            const rate = (span > 0 && naturalDur > 0) ? Math.max(0.05, naturalDur / span) : 1.0;
+            const pos = ts + local * rate;
+            if (pos < v.duration - 0.05) startAtPos(pos, rate);
+        } else if (fit === 'trim') {
+            if (ts + local < te - 0.05) startAtPos(ts + local); // інакше кліп уже завершився
+        } else { // loop
+            startAtPos(ts + (local % span));
+        }
+    });
+    return Promise.resolve();
+};
+
 const stopSlideVideos = (slide) => {
     (slide?.objects || []).filter(o => (o.type === 'video' || o.type === 'audio') && o.src).forEach(o => {
         const v = videoCache.get(o.src);
@@ -4374,6 +4460,14 @@ function videoReducer(state, action) {
             }));
         }
 
+        case 'SET_EXIT_ANIMATIONS': { // пакетна розстановка анімацій зникнення
+            const exitMap = new Map((action.exits || []).map(a => [a.objectId, a.exitAnimation]));
+            return mapSlide(action.slideId, s => ({
+                ...s,
+                objects: s.objects.map(o => exitMap.has(o.id) ? { ...o, exitAnimation: exitMap.get(o.id) } : o)
+            }));
+        }
+
         case 'UPDATE_OBJECT_ANIMATION':
             return mapSlide(action.slideId, s => ({
                 ...s,
@@ -4790,6 +4884,8 @@ export default function VideoEditor() {
     const [pronDict, setPronDict] = useState(loadPronunciationDict);
     const [pronDictOpen, setPronDictOpen] = useState(false);
     const updatePronDict = (d) => { setPronDict(d); savePronunciationDict(d); };
+    // Єдиний шрифт Roboto готовий і для порожніх проєктів (без імпорту PPTX)
+    useEffect(() => { try { ensurePresentationFonts([UNIFIED_FONT]); } catch (e) { /* ignore */ } }, []);
     // U-105: watchdog звуку — раз на 5с будимо приспаний браузером AudioContext
     useEffect(() => {
         const id = setInterval(() => {
@@ -5199,6 +5295,27 @@ export default function VideoEditor() {
                 const newId = 'obj_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
                 dispatchVideo({ type: 'DUPLICATE_OBJECT', slideId: selectedSlideId, objectId: selectedObjectId, newId });
                 setSelectedObjectId(newId);
+                return;
+            }
+
+            // Просте групування як у PowerPoint: Ctrl+G — об'єднати виділені,
+            // Ctrl+Shift+G — розгрупувати (без походу в панель «Шари»)
+            if (ctrl && (e.key === 'g' || e.key === 'G') && selectedSlideId) {
+                e.preventDefault();
+                if (shift) {
+                    const ids = multiSelectedIds.length > 0 ? multiSelectedIds : (selectedObjectId ? [selectedObjectId] : []);
+                    if (ids.length > 0) {
+                        dispatchVideo({ type: 'UNGROUP_OBJECTS', slideId: selectedSlideId, objectIds: ids });
+                        toast('info', 'Розгруповано', { action: { label: 'Повернути', onClick: () => dispatchVideo({ type: 'UNDO' }) } });
+                        logChange('Групування', 'Розгруповано (Ctrl+Shift+G)');
+                    }
+                } else if (multiSelectedIds.length >= 2) {
+                    dispatchVideo({ type: 'GROUP_OBJECTS', slideId: selectedSlideId, objectIds: multiSelectedIds });
+                    toast('success', `Об'єднано об'єктів: ${multiSelectedIds.length}`, { action: { label: 'Повернути', onClick: () => dispatchVideo({ type: 'UNDO' }) } });
+                    logChange('Групування', `Об'єднано ${multiSelectedIds.length} об'єктів (Ctrl+G)`);
+                } else {
+                    toast('info', 'Виділіть 2+ об\'єкти (Shift+клік або рамкою) і натисніть Ctrl+G');
+                }
                 return;
             }
 
@@ -5857,6 +5974,48 @@ export default function VideoEditor() {
         logChange('Синхронізація', `Анімації слайда ${slide.slideNumber} синхронізовано з аудіо (${slide.audioDuration.toFixed(1)}с)`);
     };
 
+    // Авто-зникнення: програма САМА розставляє анімації зникнення — кожен
+    // об'єкт отримує exit-ефект, дзеркальний до своєї появи, і об'єкти
+    // каскадом зникають перед самим кінцем слайда (до переходу).
+    const EXIT_MIRROR = {
+        fadeIn: 'fadeOut', appear: 'fadeOut',
+        flyInLeft: 'flyOutLeft', flyInRight: 'flyOutRight',
+        flyInTop: 'flyOutTop', flyInBottom: 'flyOutBottom',
+        floatIn: 'flyOutTop', floatDown: 'flyOutBottom',
+        zoomIn: 'zoomOut', growTurn: 'zoomOut', splitIn: 'shrink'
+    };
+    const applyAutoExitAnimations = (slideId) => {
+        const slide = slides.find(s => s.id === slideId);
+        if (!slide || slide.objects.length === 0) return;
+        const objs = slide.objects.filter(o => o.type !== 'ticker'); // титри зникають самі
+        if (!objs.length) return;
+        const dur = getSlideDuration(slide);
+        const step = 0.12, exitDur = 0.5;
+        // Останній об'єкт встигає зникнути до кінця слайда; перші — трохи раніше
+        const firstAt = Math.max(dur - exitDur - 0.2 - step * (objs.length - 1), 0.5);
+        const CYCLE = ['fadeOut', 'flyOutBottom', 'zoomOut'];
+        const exits = objs.map((o, i) => ({
+            objectId: o.id,
+            exitAnimation: {
+                type: EXIT_MIRROR[o.animation?.type] || CYCLE[i % CYCLE.length],
+                at: Math.round((firstAt + i * step) * 100) / 100,
+                duration: exitDur
+            }
+        }));
+        dispatchVideo({ type: 'SET_EXIT_ANIMATIONS', slideId, exits });
+        toast('success', `Зникнення розставлено: ${exits.length} об'єкт(ів)`, {
+            action: { label: 'Повернути', onClick: () => dispatchVideo({ type: 'UNDO' }) }
+        });
+        logChange('Анімація', `Слайд ${slide.slideNumber}: авто-зникнення для ${exits.length} об'єктів`);
+    };
+    const clearExitAnimations = (slideId) => {
+        const slide = slides.find(s => s.id === slideId);
+        if (!slide) return;
+        dispatchVideo({ type: 'SET_EXIT_ANIMATIONS', slideId, exits: slide.objects.map(o => ({ objectId: o.id, exitAnimation: null })) });
+        toast('info', 'Анімації зникнення прибрано');
+        logChange('Анімація', `Слайд ${slide.slideNumber}: зникнення прибрано`);
+    };
+
     // Синхронізувати з аудіо анімації УСІХ слайдів (де є озвучка) — одним кліком
     const syncAllAnimationsToAudio = () => {
         let n = 0;
@@ -6104,7 +6263,7 @@ export default function VideoEditor() {
                 <div className="flex items-center gap-3 w-28 flex-shrink-0">
                     <button
                         className="w-11 h-11 rounded-full bg-slate-50 border border-slate-100 flex items-center justify-center hover:bg-slate-100 transition-colors text-slate-700 shadow-sm"
-                        onClick={(e) => { e.stopPropagation(); isPreviewing ? stopPreview() : startPreview(); }}
+                        onClick={(e) => { e.stopPropagation(); isPreviewing ? stopPreview() : startPreview(scrubTime ?? 0); }}
                     >
                         {isPreviewing ? <Square size={16} fill="currentColor" /> : <Play size={18} fill="currentColor" className="ml-1" />}
                     </button>
@@ -6347,7 +6506,7 @@ export default function VideoEditor() {
             type: 'text',
             x: 340, y: 300, w: 600, h: 120,
             fillColor: null, lineColor: null,
-            lines: [{ text: 'Новий текст', color: '#1e293b', fontSize: 40, bold: true, align: 'ctr' }],
+            lines: [{ text: 'Новий текст', color: '#1e293b', fontSize: 40, bold: true, align: 'ctr', font: UNIFIED_FONT }],
             animation: { type: 'fadeIn', delay: 0, duration: 0.8 }
         };
         dispatchVideo({ type: 'ADD_OBJECT', slideId: selectedSlide.id, object });
@@ -6696,7 +6855,9 @@ export default function VideoEditor() {
         if (previewStopRef.current) previewStopRef.current();
     };
 
-    const startPreview = async () => {
+    // startAt — позиція (с), з якої почати відтворення: активний таймлайн
+    // дозволяє перевіряти анімації/відео/озвучку з будь-якого місця, як у плеєрі
+    const startPreview = async (startAt = 0) => {
         if (!selectedSlide || isPreviewing) return;
         const slide = selectedSlide;
         await preloadSlideImages(slide);
@@ -6708,6 +6869,7 @@ export default function VideoEditor() {
             if (!canvas) { setIsPreviewing(false); return; }
             const ctx = canvas.getContext('2d');
             const duration = getSlideDuration(slide);
+            const from = Math.max(0, Math.min(Number(startAt) || 0, Math.max(duration - 0.15, 0)));
 
             let rafId = null;
             let source = null;
@@ -6715,21 +6877,28 @@ export default function VideoEditor() {
 
             // Спершу відео (чекаємо реального старту кадрів), потім озвучка й годинник —
             // інакше звук випереджає картинку вбудованого відео на час його декодування
-            await primeSlideVideos(slide);
-            await playSlideVideos(slide);
+            if (from > 0.05) {
+                await playSlideVideosFrom(slide, from);
+            } else {
+                await primeSlideVideos(slide);
+                await playSlideVideos(slide);
+            }
 
             if (slide.audioBase64) {
                 getLiveAudioCtx(); // U-105: авто-відновлення після suspend/closed
                 const buffer = base64ToAudioBuffer(currentCtx, slide.audioBase64, slide.sampleRate);
-                source = currentCtx.createBufferSource();
-                source.buffer = buffer;
-                source.connect(currentCtx.destination);
-                source.start();
+                if (from < buffer.duration - 0.05) { // стартуємо озвучку з позиції скраба
+                    source = currentCtx.createBufferSource();
+                    source.buffer = buffer;
+                    source.connect(currentCtx.destination);
+                    source.start(0, from);
+                }
             }
 
             if (slide.bgAudio) {
                 bgAudioEl = new Audio(slide.bgAudio);
                 bgAudioEl.crossOrigin = 'anonymous';
+                try { bgAudioEl.currentTime = from; } catch (e) { /* не критично */ }
                 bgAudioEl.play().catch(e => console.error("Preview bgAudio play error:", e));
             }
 
@@ -6745,7 +6914,7 @@ export default function VideoEditor() {
 
             const startTime = performance.now();
             const loop = (now) => {
-                const t = (now - startTime) / 1000;
+                const t = from + (now - startTime) / 1000; // час слайда = позиція скраба + минулий час
                 drawSlideFrame(ctx, slide, t);
                 // Фіолетовий бігунок таймлайну рухається разом із програванням
                 const tr = Math.min(Math.round(t * 10) / 10, duration);
@@ -8491,6 +8660,25 @@ export default function VideoEditor() {
                     >
                         ∅ Без анімацій (весь слайд)
                     </button>
+                    {/* Авто-зникнення: exit-анімації розставляються самі */}
+                    <div className="grid grid-cols-2 gap-1.5">
+                        <button
+                            onClick={() => applyAutoExitAnimations(slide.id)}
+                            disabled={slide.objects.length === 0}
+                            className="px-2 py-1.5 bg-rose-50 text-rose-600 hover:bg-rose-100 disabled:opacity-40 rounded-xl text-[11px] font-bold transition-colors"
+                            title="Програма сама розставить анімації зникнення: кожен об'єкт зникає дзеркально до своєї появи, каскадом перед кінцем слайда"
+                        >
+                            💨 Авто-зникнення
+                        </button>
+                        <button
+                            onClick={() => clearExitAnimations(slide.id)}
+                            disabled={slide.objects.length === 0}
+                            className="px-2 py-1.5 bg-slate-50 text-slate-500 hover:bg-slate-100 disabled:opacity-40 rounded-xl text-[11px] font-bold transition-colors"
+                            title="Прибрати анімації зникнення з усіх об'єктів слайда (появи не чіпаються)"
+                        >
+                            без зникнень
+                        </button>
+                    </div>
                     {/* Бігучий рядок — титри, що пролітають наприкінці слайда */}
                     <button
                         onClick={addTicker}
@@ -9573,7 +9761,7 @@ export default function VideoEditor() {
                             <div className="bg-white border-t border-slate-200">
                                 <div className="px-4 py-2 flex items-center gap-3">
                                     <button
-                                        onClick={(e) => { e.stopPropagation(); isPreviewing ? stopPreview() : startPreview(); }}
+                                        onClick={(e) => { e.stopPropagation(); isPreviewing ? stopPreview() : startPreview(scrubTime ?? 0); }}
                                         disabled={!vSlide}
                                         className="w-8 h-8 flex-shrink-0 rounded-full flex items-center justify-center bg-slate-100 hover:bg-slate-200 text-slate-600 transition-colors"
                                     >
