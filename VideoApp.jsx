@@ -5645,6 +5645,58 @@ export default function VideoEditor() {
         logChange('Медіа', `${obj.type === 'audio' ? 'Аудіо' : 'Відео'} розрізано на ${atTime.toFixed(1)}с`, { slideId, objId });
     };
 
+    // --- Розрізання ЗГЕНЕРОВАНОЇ озвучки (TTS) у позиції бігунка ---
+    // Озвучка — mono PCM16, тож ріжемо точно по семплах. Перша частина
+    // лишається озвучкою слайда (статус «озвучено» зберігається), хвіст стає
+    // незалежним аудіо-кліпом 🎵, що стартує в точці розрізу: його можна
+    // зсувати, тримити, розрізати ще раз чи видалити.
+    const splitNarrationAt = (slideId, atTime) => {
+        const slide = slides.find(s => s.id === slideId);
+        if (!slide || !slide.audioBase64 || !(slide.audioDuration > 0)) {
+            toast('info', 'На цьому слайді немає згенерованої озвучки');
+            return;
+        }
+        if (atTime == null || atTime < 0.2 || atTime > slide.audioDuration - 0.2) {
+            toast('info', `Поставте бігунок усередині озвучки (0.2–${Math.max(slide.audioDuration - 0.2, 0.2).toFixed(1)}с) і натисніть «Розрізати озвучку»`);
+            return;
+        }
+        try {
+            const bin = atob(slide.audioBase64);
+            const bytes = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+            const pcm = new Int16Array(bytes.buffer);
+            const sr = slide.sampleRate || 24000;
+            const cutSample = Math.max(1, Math.min(pcm.length - 1, Math.round(atTime * sr)));
+            const part2 = pcm.slice(cutSample); // копія хвоста
+            // Перша частина назад у base64 (лишається озвучкою слайда)
+            const p1 = new Uint8Array(bytes.buffer, 0, cutSample * 2);
+            let s1 = '';
+            const CHUNK = 0x8000;
+            for (let i = 0; i < p1.length; i += CHUNK) s1 += String.fromCharCode.apply(null, p1.subarray(i, i + CHUNK));
+            const cutT = Math.round(atTime * 100) / 100;
+            const src = URL.createObjectURL(pcmToWavBlob(part2, sr));
+            const newId = 'obj_' + Date.now() + '_' + Math.random().toString(36).slice(2, 6);
+            dispatchVideo({ type: 'UPDATE_SLIDE', slideId, updates: { audioBase64: btoa(s1), audioDuration: cutT } });
+            dispatchVideo({
+                type: 'ADD_OBJECT', slideId, object: {
+                    id: newId, type: 'audio', src,
+                    x: 40, y: CANVAS_H - 160, w: 120, h: 120,
+                    videoFitMode: 'trim', trimStart: 0, trimEnd: null,
+                    animation: { type: 'none', delay: cutT, duration: 0.5 }
+                }
+            });
+            loadVideo(src); // гріємо, щоб тривалість/старт були миттєві
+            setSelectedObjectId(newId);
+            toast('success', `Озвучку розрізано на ${cutT.toFixed(1)}с — хвіст став окремим кліпом 🎵 (зсувайте/тримте/видаляйте)`, {
+                duration: 7000,
+                action: { label: 'Повернути', onClick: () => { dispatchVideo({ type: 'UNDO' }); dispatchVideo({ type: 'UNDO' }); } }
+            });
+            logChange('Озвучка', `TTS розрізано на ${cutT.toFixed(1)}с`, { slideId });
+        } catch (e) {
+            toast('error', 'Не вдалося розрізати озвучку: ' + (e.message || e));
+        }
+    };
+
     // --- Перетягування блоків анімацій на таймлайні (зміна delay) ---
 
     const handleTimelineDragMove = useCallback((e) => {
@@ -9623,6 +9675,36 @@ export default function VideoEditor() {
                                                 💨 Авто-зникнення (всі слайди)
                                             </button>
                                         </div>
+                                        {/* Вибір трьох анімацій прямо під AI-кнопками: заголовки/медіа/решта */}
+                                        <div className="flex items-center gap-2 flex-wrap pt-2 border-t border-slate-100">
+                                            <span className="text-[11px] font-bold text-slate-500 whitespace-nowrap" title="Єдиний стиль: заголовки — тип 1, зображення/відео — тип 2, решта — тип 3, поява каскадом">
+                                                🎯 Мої 3 анімації:
+                                            </span>
+                                            {[['заголовки', 0], ['медіа', 1], ['решта', 2]].map(([role, i]) => (
+                                                <label key={i} className="flex items-center gap-1 text-[10px] font-semibold text-slate-400">
+                                                    {role}
+                                                    <select
+                                                        value={uniformTypes[i]}
+                                                        onChange={(e) => setUniformTypes(prev => prev.map((t, j) => (j === i ? e.target.value : t)))}
+                                                        className="text-[11px] font-semibold text-slate-700 border border-slate-200 rounded-lg px-1.5 py-1 outline-none focus:border-[#7c3aed] bg-white max-w-[130px]"
+                                                    >
+                                                        {ANIMATION_OPTION_GROUPS.map(g => (
+                                                            <optgroup key={g.label} label={g.label}>
+                                                                {g.items.filter(([v]) => v !== 'none').map(([val, lbl]) => <option key={val} value={val}>{lbl}</option>)}
+                                                            </optgroup>
+                                                        ))}
+                                                    </select>
+                                                </label>
+                                            ))}
+                                            <button
+                                                onClick={applyUniformAnimations}
+                                                disabled={slides.length === 0}
+                                                className="px-3 py-1.5 bg-emerald-50 text-emerald-700 hover:bg-emerald-100 disabled:opacity-40 rounded-lg text-xs font-bold transition-colors whitespace-nowrap"
+                                                title="Анімувати ВСІ елементи всіх слайдів лише цими трьома типами (тексти диктора й озвучка не змінюються)"
+                                            >
+                                                Застосувати до всіх
+                                            </button>
+                                        </div>
                                         {/* Зворотна конвертація: відкрити експортований MP4 назад у редактор */}
                                         <div className="flex items-center gap-2 flex-wrap">
                                             <button
@@ -10045,6 +10127,19 @@ export default function VideoEditor() {
                                         />
                                         <ZoomIn size={14} className="text-slate-400 cursor-pointer hover:text-[#7c3aed]" onClick={() => setTimelineZoom(z => Math.min(10, z + 0.5))} />
                                     </div>
+                                    {/* Розрізання згенерованої озвучки (TTS) у позиції бігунка */}
+                                    {vSlide.audioBase64 && vSlide.audioDuration > 0 && (
+                                        <button
+                                            onClick={() => splitNarrationAt(vSlide.id, scrubTime)}
+                                            disabled={scrubTime == null || scrubTime < 0.2 || scrubTime > vSlide.audioDuration - 0.2}
+                                            className="flex-shrink-0 px-2 py-1 mr-2 rounded-lg bg-amber-50 text-amber-700 hover:bg-amber-100 disabled:opacity-40 text-[10px] font-bold whitespace-nowrap transition-colors"
+                                            title={scrubTime == null
+                                                ? 'Поставте бігунок усередині озвучки — і розріжте її тут'
+                                                : `Розрізати згенеровану озвучку на ${scrubTime.toFixed(1)}с: хвіст стане окремим аудіо-кліпом, який можна зсувати/тримити/видаляти`}
+                                        >
+                                            ✂ Озвучку{scrubTime != null ? ` (${scrubTime.toFixed(1)}с)` : ''}
+                                        </button>
+                                    )}
 
                                     <div
                                         className="flex-grow overflow-x-auto overflow-y-hidden"
